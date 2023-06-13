@@ -24,6 +24,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define _QCOMMON_H_
 
 #include "../qcommon/cm_public.h"
+#include <pan/pan.h>
+#ifdef USE_LIBSODIUM
+#include <sodium.h>
+#endif
 
 //Ignore __attribute__ on non-gcc platforms
 #ifndef __GNUC__
@@ -100,7 +104,7 @@ void MSG_ReadDeltaUsercmdKey( msg_t *msg, int key, usercmd_t *from, usercmd_t *t
 
 void MSG_WriteDeltaEntity( msg_t *msg, struct entityState_s *from, struct entityState_s *to
 						   , qboolean force );
-void MSG_ReadDeltaEntity( msg_t *msg, entityState_t *from, entityState_t *to, 
+void MSG_ReadDeltaEntity( msg_t *msg, entityState_t *from, entityState_t *to,
 						 int number );
 
 void MSG_WriteDeltaPlayerstate( msg_t *msg, struct playerState_s *from, struct playerState_s *to );
@@ -125,6 +129,7 @@ NET
 #define NET_PRIOV6              0x04
 // disables ipv6 multicast support if set.
 #define NET_DISABLEMCAST        0x08
+#define NET_ENABLE_SCION        0x10
 
 
 #define	PACKET_BACKUP	32	// number of old messages that must be kept on client and
@@ -147,6 +152,8 @@ typedef enum {
 	NA_IP,
 	NA_IP6,
 	NA_MULTICAST6,
+	NA_SCION_IP,
+	NA_SCION_IP6,
 	NA_UNSPEC
 } netadrtype_t;
 
@@ -155,12 +162,14 @@ typedef enum {
 	NS_SERVER
 } netsrc_t;
 
-#define NET_ADDRSTRMAXLEN 48	// maximum length of an IPv6 address string including trailing '\0'
+#define NET_ADDRSTRMAXLEN 128
 typedef struct {
 	netadrtype_t	type;
 
-	byte	ip[4];
-	byte	ip6[16];
+	byte isd[2];  // for SCION
+	byte asn[6];  // for SCION
+	byte ip[4];
+	byte ip6[16];
 
 	unsigned short	port;
 	unsigned long	scope_id;	// Needed for IPv6 link-local addresses
@@ -170,18 +179,25 @@ void		NET_Init( void );
 void		NET_Shutdown( void );
 void		NET_Restart_f( void );
 void		NET_Config( qboolean enableNetworking );
-void		NET_FlushPacketQueue(void);
-void		NET_SendPacket (netsrc_t sock, int length, const void *data, netadr_t to);
-void		QDECL NET_OutOfBandPrint( netsrc_t net_socket, netadr_t adr, const char *format, ...) __attribute__ ((format (printf, 3, 4)));
-void		QDECL NET_OutOfBandData( netsrc_t sock, netadr_t adr, byte *format, int len );
+void		NET_ScionServerStart(void);
+void		NET_ScionServerStop(void);
+qboolean    NET_ScionClientConnect(const netadr_t *to);
+void        NET_ScionClientClose(void);
 
-qboolean	NET_CompareAdr (netadr_t a, netadr_t b);
-qboolean	NET_CompareBaseAdrMask(netadr_t a, netadr_t b, int netmask);
-qboolean	NET_CompareBaseAdr (netadr_t a, netadr_t b);
-qboolean	NET_IsLocalAddress (netadr_t adr);
-const char	*NET_AdrToString (netadr_t a);
-const char	*NET_AdrToStringwPort (netadr_t a);
-int		NET_StringToAdr ( const char *s, netadr_t *a, netadrtype_t family);
+void		NET_FlushPacketQueue(void);
+void		NET_SendPacket (netsrc_t sock, int length, const void *data, const netadr_t *to);
+void		QDECL NET_OutOfBandPrint( netsrc_t net_socket, const netadr_t *adr, const char *format, ...) __attribute__ ((format (printf, 3, 4)));
+void		QDECL NET_OutOfBandData( netsrc_t sock, const netadr_t *adr, byte *format, int len );
+
+qboolean	NET_CompareAdr (const netadr_t *a, const netadr_t *b);
+qboolean	NET_CompareBaseAdrMask(const netadr_t *a, const netadr_t *b, int netmask);
+qboolean	NET_CompareBaseAdr (const netadr_t *a, const netadr_t *b);
+qboolean	NET_IsLocalAddress (const netadr_t *adr);
+void		NET_GetLocalForPan(char *addr, int size, int offset);
+PanUDPAddr 	NET_AddressToPan(const netadr_t *to);
+const char	*NET_AdrToString (const netadr_t *a);
+const char	*NET_AdrToStringwPort (const netadr_t *a);
+int			NET_StringToAdr (const char *s, netadr_t *a, netadrtype_t family);
 qboolean	NET_GetLoopPacket (netsrc_t sock, netadr_t *net_from, msg_t *net_message);
 void		NET_JoinMulticast6(void);
 void		NET_LeaveMulticast6(void);
@@ -201,6 +217,8 @@ void		NET_Sleep(int msec);
 Netchan handles packet fragmentation and out of order / duplicate suppression
 */
 
+#define	MAX_PACKETLEN 1200 // max size of a network packet
+
 typedef struct {
 	netsrc_t	sock;
 
@@ -215,7 +233,7 @@ typedef struct {
 
 	// incoming fragment assembly buffer
 	int			fragmentSequence;
-	int			fragmentLength;	
+	int			fragmentLength;
 	byte		fragmentBuffer[MAX_MSGLEN];
 
 	// outgoing fragment buffer
@@ -229,13 +247,24 @@ typedef struct {
 	int		lastSentTime;
 	int		lastSentSize;
 
+#ifdef USE_LIBSODIUM
+	// encryption
+	qboolean encrypted;
+	byte nonce[crypto_aead_chacha20poly1305_NPUBBYTES];
+	byte txKey[crypto_aead_chacha20poly1305_KEYBYTES];
+	byte rxKey[crypto_aead_chacha20poly1305_KEYBYTES];
+#endif
+
 #ifdef LEGACY_PROTOCOL
 	qboolean	compat;
 #endif
 } netchan_t;
 
 void Netchan_Init( int qport );
-void Netchan_Setup(netsrc_t sock, netchan_t *chan, netadr_t adr, int qport, int challenge, qboolean compat);
+void Netchan_Setup(netsrc_t sock, netchan_t *chan, const netadr_t *adr, int qport, int challenge, qboolean compat);
+#ifdef USE_LIBSODIUM
+qboolean Netchan_InitSession(netchan_t *chan, const byte *publicKey, const byte *secretKey, const char *remoteKeyBase64);
+#endif
 
 void Netchan_Transmit( netchan_t *chan, int length, const byte *data );
 void Netchan_TransmitNextFragment( netchan_t *chan );
@@ -310,7 +339,7 @@ enum svc_ops_e {
 //
 enum clc_ops_e {
 	clc_bad,
-	clc_nop, 		
+	clc_nop,
 	clc_move,				// [[usercmd_t]
 	clc_moveNoDelta,		// [[usercmd_t]
 	clc_clientCommand,		// [string] message
@@ -358,7 +387,7 @@ typedef enum {
 typedef intptr_t (QDECL *vmMainProc)(int callNum, int arg0, int arg1, int arg2, int arg3, int arg4, int arg5, int arg6, int arg7, int arg8, int arg9, int arg10, int arg11);
 
 void	VM_Init( void );
-vm_t	*VM_Create( const char *module, intptr_t (*systemCalls)(intptr_t *), 
+vm_t	*VM_Create( const char *module, intptr_t (*systemCalls)(intptr_t *),
 				   vmInterpret_t interpret );
 // module should be bare: "cgame", not "cgame.dll" or "vm/cgame.qvm"
 
@@ -713,9 +742,9 @@ const char *FS_LoadedPakPureChecksums( void );
 const char *FS_ReferencedPakNames( void );
 const char *FS_ReferencedPakChecksums( void );
 const char *FS_ReferencedPakPureChecksums( void );
-// Returns a space separated string containing the checksums of all loaded 
-// AND referenced pk3 files. Servers with sv_pure set will get this string 
-// back from clients for pure validation 
+// Returns a space separated string containing the checksums of all loaded
+// AND referenced pk3 files. Servers with sv_pure set will get this string
+// back from clients for pure validation
 
 void FS_ClearPakReferences( int flags );
 // clears referenced booleans on loaded pk3s
@@ -997,7 +1026,7 @@ void CL_MouseEvent( int dx, int dy, int time );
 
 void CL_JoystickEvent( int axis, int value, int time );
 
-void CL_PacketEvent( netadr_t from, msg_t *msg );
+void CL_PacketEvent( const netadr_t *from, msg_t *msg );
 
 void CL_ConsolePrint( char *text );
 
@@ -1050,7 +1079,7 @@ void SCR_DebugGraph (float value);	// FIXME: move logging to common?
 void SV_Init( void );
 void SV_Shutdown( char *finalmsg );
 void SV_Frame( int msec );
-void SV_PacketEvent( netadr_t from, msg_t *msg );
+void SV_PacketEvent( const netadr_t *from, msg_t *msg );
 int SV_FrameMsec(void);
 qboolean SV_GameCommand( void );
 int SV_SendQueuedPackets(void);
@@ -1109,12 +1138,13 @@ cpuFeatures_t Sys_GetProcessorFeatures( void );
 
 void	Sys_SetErrorText( const char *text );
 
-void	Sys_SendPacket( int length, const void *data, netadr_t to );
+void	Sys_SendPacket( int length, const void *data, const netadr_t *to );
+qboolean Sys_SendScionPacketVia(int length, const void *data, const netadr_t *to, PanPath path);
 
 qboolean	Sys_StringToAdr( const char *s, netadr_t *a, netadrtype_t family );
 //Does NOT parse port numbers, only base addresses.
 
-qboolean	Sys_IsLANAddress (netadr_t adr);
+qboolean	Sys_IsLANAddress (const netadr_t *adr);
 void		Sys_ShowIP(void);
 
 FILE	*Sys_FOpen( const char *ospath, const char *mode );
@@ -1175,7 +1205,7 @@ void Sys_InitPIDFile( const char *gamedir );
 #define INTERNAL_NODE (HMAX+1)
 
 typedef struct nodetype {
-	struct	nodetype *left, *right, *parent; /* tree structure */ 
+	struct	nodetype *left, *right, *parent; /* tree structure */
 	struct	nodetype *next, *prev; /* doubly-linked list */
 	struct	nodetype **head; /* highest ranked node in block */
 	int		weight;

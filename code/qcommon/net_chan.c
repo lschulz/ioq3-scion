@@ -22,6 +22,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "q_shared.h"
 #include "qcommon.h"
+#include <pan/pan.h>
+#include <arpa/inet.h>
 
 /*
 
@@ -46,10 +48,12 @@ to the new value before sending out any replies.
 
 */
 
-
-#define	MAX_PACKETLEN			1400		// max size of a network packet
-
-#define	FRAGMENT_SIZE			(MAX_PACKETLEN - 100)
+#ifndef USE_LIBSODIUM
+#define CRYPTO_OVERHEAD			0
+#else
+#define CRYPTO_OVERHEAD         (crypto_aead_chacha20poly1305_ABYTES + crypto_aead_chacha20poly1305_NPUBBYTES)
+#endif
+#define	FRAGMENT_SIZE			(MAX_PACKETLEN - 100 - CRYPTO_OVERHEAD)
 #define	PACKET_HEADER			10			// two ints and a short
 
 #define	FRAGMENT_BIT	(1U<<31)
@@ -83,21 +87,101 @@ Netchan_Setup
 called to open a channel to a remote system
 ==============
 */
-void Netchan_Setup(netsrc_t sock, netchan_t *chan, netadr_t adr, int qport, int challenge, qboolean compat)
+void Netchan_Setup(netsrc_t sock, netchan_t *chan, const netadr_t *adr, int qport, int challenge, qboolean compat)
 {
 	Com_Memset (chan, 0, sizeof(*chan));
-	
+
 	chan->sock = sock;
-	chan->remoteAddress = adr;
+	chan->remoteAddress = *adr;
 	chan->qport = qport;
 	chan->incomingSequence = 0;
 	chan->outgoingSequence = 1;
 	chan->challenge = challenge;
 
+#ifdef USE_LIBSODIUM
+	chan->encrypted = qfalse;
+#endif
+
 #ifdef LEGACY_PROTOCOL
 	chan->compat = compat;
 #endif
 }
+
+#ifdef USE_LIBSODIUM
+/*
+=================
+Netchan_InitSession
+
+Initialize an encrypted connection after the channel has been set up (Netchan_Setup).
+=================
+*/
+qboolean Netchan_InitSession(
+	netchan_t *chan, const byte *publicKey, const byte *secretKey, const char *remoteKeyBase64)
+{
+	byte remoteKey[crypto_kx_PUBLICKEYBYTES];
+	size_t binLen = 0;
+
+	if (sodium_base642bin(remoteKey, sizeof(remoteKey), remoteKeyBase64, strlen(remoteKeyBase64),
+		NULL, &binLen, NULL, sodium_base64_VARIANT_ORIGINAL))
+		return qfalse;
+	if (binLen != sizeof(remoteKey))
+		return qfalse;
+
+	if (chan->sock == NS_CLIENT)
+	{
+		if (crypto_kx_client_session_keys(chan->rxKey, chan->txKey, publicKey, secretKey, remoteKey))
+			return qfalse;
+	}
+	else
+	{
+		if (crypto_kx_server_session_keys(chan->rxKey, chan->txKey, publicKey, secretKey, remoteKey))
+			return qfalse;
+	}
+
+	randombytes_buf(chan->nonce, sizeof(chan->nonce));
+	chan->encrypted = qtrue;
+
+	Com_Printf("Set up encrypted netchan to %s\n", NET_AdrToStringwPort(&chan->remoteAddress));
+	return qtrue;
+}
+
+/*
+=================
+Netchan_SendEncrypted
+
+Encrypt and transmit a packet.
+=================
+*/
+static void Netchan_SendEncrypted(netchan_t *chan, int length, const void *data, const netadr_t *to)
+{
+	byte buf[MAX_PACKETLEN];
+	sodium_increment(chan->nonce, sizeof(chan->nonce));
+
+	unsigned long long hdrLen = 4; // sequence number from server
+	if (chan->sock == NS_CLIENT) hdrLen = 6; // sequence number and qport from client
+
+	// Copy unencrypted but authenticated header bytes
+	memcpy(buf, data, hdrLen);
+
+	// Encrypt message and add authentication tag
+	unsigned long long outlen = sizeof(buf) - hdrLen;
+	int res = crypto_aead_chacha20poly1305_encrypt(
+		buf + hdrLen, &outlen,			// output
+		data + hdrLen, length - hdrLen,	// plaintext
+		data, hdrLen,					// additional data
+		NULL, chan->nonce, chan->txKey);
+	if (res)
+		Com_Error(ERR_DROP, "Netchan_SendEncrypted: length = %i", length);
+
+	// Append nonce to message
+	unsigned long long total = outlen + hdrLen + sizeof(chan->nonce);
+	if (total > MAX_PACKETLEN)
+		Com_Error(ERR_DROP, "Netchan_SendEncrypted: length = %i", length);
+	memcpy(buf + hdrLen + outlen, chan->nonce, sizeof(chan->nonce));
+
+	NET_SendPacket(chan->sock, total, buf, to);
+}
+#endif // USE_LIBSODIUM
 
 /*
 =================
@@ -139,8 +223,13 @@ void Netchan_TransmitNextFragment( netchan_t *chan ) {
 	MSG_WriteData( &send, chan->unsentBuffer + chan->unsentFragmentStart, fragmentLength );
 
 	// send the datagram
-	NET_SendPacket(chan->sock, send.cursize, send.data, chan->remoteAddress);
-	
+#ifdef USE_LIBSODIUM
+	if (chan->encrypted)
+		Netchan_SendEncrypted(chan, send.cursize, send.data, &chan->remoteAddress);
+	else
+#endif
+		NET_SendPacket(chan->sock, send.cursize, send.data, &chan->remoteAddress);
+
 	// Store send time and size of this packet for rate control
 	chan->lastSentTime = Sys_Milliseconds();
 	chan->lastSentSize = send.cursize;
@@ -164,7 +253,6 @@ void Netchan_TransmitNextFragment( netchan_t *chan ) {
 		chan->unsentFragments = qfalse;
 	}
 }
-
 
 /*
 ===============
@@ -214,7 +302,12 @@ void Netchan_Transmit( netchan_t *chan, int length, const byte *data ) {
 	MSG_WriteData( &send, data, length );
 
 	// send the datagram
-	NET_SendPacket( chan->sock, send.cursize, send.data, chan->remoteAddress );
+#ifdef USE_LIBSODIUM
+	if (chan->encrypted)
+		Netchan_SendEncrypted(chan, send.cursize, send.data, &chan->remoteAddress);
+	else
+#endif
+		NET_SendPacket(chan->sock, send.cursize, send.data, &chan->remoteAddress);
 
 	// Store send time and size of this packet for rate control
 	chan->lastSentTime = Sys_Milliseconds();
@@ -249,7 +342,37 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 	// XOR unscramble all data in the packet after the header
 //	Netchan_UnScramblePacket( msg );
 
-	// get sequence numbers		
+#ifdef USE_LIBSODIUM
+	if (chan->encrypted) {
+		unsigned long long hdrLen = 6; // sequence number and port from client
+		if (chan->sock == NS_CLIENT) hdrLen = 4; // sequence number from server
+		const unsigned long long hdrAndNonce = hdrLen + crypto_aead_chacha20poly1305_NPUBBYTES;
+
+		if (msg->cursize < hdrAndNonce)
+			return qfalse;
+
+		// Cyphertext follows unencrypted header
+		unsigned long long clen = msg->cursize - hdrAndNonce;
+		byte *cyphertext = msg->data + hdrLen;
+
+		// Nonce is at the end of the packet
+		byte *nonce = msg->data + msg->cursize - crypto_aead_chacha20poly1305_NPUBBYTES;
+
+		// Decrypt directly into the message buffer
+		unsigned long long outlen = msg->maxsize - hdrLen;
+		int ret = crypto_aead_chacha20poly1305_decrypt(cyphertext, &outlen, NULL,
+			cyphertext, clen, msg->data, hdrLen, nonce, chan->rxKey);
+		if (ret) {
+			Com_Printf("WARNING: Netchan_Process: Message verification failed\n");
+			return qfalse;
+		}
+
+		// Through away the nonce
+		msg->cursize = outlen + hdrLen;
+	}
+#endif
+
+	// get sequence numbers
 	MSG_BeginReadingOOB( msg );
 	sequence = MSG_ReadLong( msg );
 
@@ -307,7 +430,7 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 	if ( sequence <= chan->incomingSequence ) {
 		if ( showdrop->integer || showpackets->integer ) {
 			Com_Printf( "%s:Out of order packet %i at %i\n"
-				, NET_AdrToString( chan->remoteAddress )
+				, NET_AdrToString( &chan->remoteAddress )
 				,  sequence
 				, chan->incomingSequence );
 		}
@@ -321,16 +444,16 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 	if ( chan->dropped > 0 ) {
 		if ( showdrop->integer || showpackets->integer ) {
 			Com_Printf( "%s:Dropped %i packets at %i\n"
-			, NET_AdrToString( chan->remoteAddress )
+			, NET_AdrToString( &chan->remoteAddress )
 			, chan->dropped
 			, sequence );
 		}
 	}
-	
+
 
 	//
 	// if this is the final framgent of a reliable message,
-	// bump incoming_reliable_sequence 
+	// bump incoming_reliable_sequence
 	//
 	if ( fragmented ) {
 		// TTimo
@@ -347,7 +470,7 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 		if ( fragmentStart != chan->fragmentLength ) {
 			if ( showdrop->integer || showpackets->integer ) {
 				Com_Printf( "%s:Dropped a message fragment\n"
-				, NET_AdrToString( chan->remoteAddress ));
+				, NET_AdrToString( &chan->remoteAddress ));
 			}
 			// we can still keep the part that we have so far,
 			// so we don't need to clear chan->fragmentLength
@@ -359,12 +482,12 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 			chan->fragmentLength + fragmentLength > sizeof( chan->fragmentBuffer ) ) {
 			if ( showdrop->integer || showpackets->integer ) {
 				Com_Printf ("%s:illegal fragment length\n"
-				, NET_AdrToString (chan->remoteAddress ) );
+				, NET_AdrToString (&chan->remoteAddress ) );
 			}
 			return qfalse;
 		}
 
-		Com_Memcpy( chan->fragmentBuffer + chan->fragmentLength, 
+		Com_Memcpy( chan->fragmentBuffer + chan->fragmentLength,
 			msg->data + msg->readcount, fragmentLength );
 
 		chan->fragmentLength += fragmentLength;
@@ -376,7 +499,7 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 
 		if ( chan->fragmentLength > msg->maxsize ) {
 			Com_Printf( "%s:fragmentLength %i > msg->maxsize\n"
-				, NET_AdrToString (chan->remoteAddress ),
+				, NET_AdrToString (&chan->remoteAddress ),
 				chan->fragmentLength );
 			return qfalse;
 		}
@@ -395,7 +518,7 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 		// TTimo
 		// clients were not acking fragmented messages
 		chan->incomingSequence = sequence;
-		
+
 		return qtrue;
 	}
 
@@ -461,7 +584,7 @@ qboolean	NET_GetLoopPacket (netsrc_t sock, netadr_t *net_from, msg_t *net_messag
 }
 
 
-void NET_SendLoopPacket (netsrc_t sock, int length, const void *data, netadr_t to)
+void NET_SendLoopPacket (netsrc_t sock, int length, const void *data, const netadr_t *to)
 {
 	int		i;
 	loopback_t	*loop;
@@ -487,7 +610,7 @@ typedef struct packetQueue_s {
 
 packetQueue_t *packetQueue = NULL;
 
-static void NET_QueuePacket( int length, const void *data, netadr_t to,
+static void NET_QueuePacket( int length, const void *data, const netadr_t *to,
 	int offset )
 {
 	packetQueue_t *new, *next = packetQueue;
@@ -499,8 +622,8 @@ static void NET_QueuePacket( int length, const void *data, netadr_t to,
 	new->data = S_Malloc(length);
 	Com_Memcpy(new->data, data, length);
 	new->length = length;
-	new->to = to;
-	new->release = Sys_Milliseconds() + (int)((float)offset / com_timescale->value);	
+	new->to = *to;
+	new->release = Sys_Milliseconds() + (int)((float)offset / com_timescale->value);
 	new->next = NULL;
 
 	if(!packetQueue) {
@@ -525,8 +648,7 @@ void NET_FlushPacketQueue(void)
 		now = Sys_Milliseconds();
 		if(packetQueue->release >= now)
 			break;
-		Sys_SendPacket(packetQueue->length, packetQueue->data,
-			packetQueue->to);
+		Sys_SendPacket(packetQueue->length, packetQueue->data, &packetQueue->to);
 		last = packetQueue;
 		packetQueue = packetQueue->next;
 		Z_Free(last->data);
@@ -534,21 +656,21 @@ void NET_FlushPacketQueue(void)
 	}
 }
 
-void NET_SendPacket( netsrc_t sock, int length, const void *data, netadr_t to ) {
+void NET_SendPacket( netsrc_t sock, int length, const void *data, const netadr_t *to ) {
 
 	// sequenced packets are shown in netchan, so just show oob
 	if ( showpackets->integer && *(int *)data == -1 )	{
 		Com_Printf ("send packet %4i\n", length);
 	}
 
-	if ( to.type == NA_LOOPBACK ) {
+	if ( to->type == NA_LOOPBACK ) {
 		NET_SendLoopPacket (sock, length, data, to);
 		return;
 	}
-	if ( to.type == NA_BOT ) {
+	if ( to->type == NA_BOT ) {
 		return;
 	}
-	if ( to.type == NA_BAD ) {
+	if ( to->type == NA_BAD ) {
 		return;
 	}
 
@@ -570,7 +692,7 @@ NET_OutOfBandPrint
 Sends a text message in an out-of-band datagram
 ================
 */
-void QDECL NET_OutOfBandPrint( netsrc_t sock, netadr_t adr, const char *format, ... ) {
+void QDECL NET_OutOfBandPrint( netsrc_t sock, const netadr_t *adr, const char *format, ... ) {
 	va_list		argptr;
 	char		string[MAX_MSGLEN];
 
@@ -596,7 +718,7 @@ NET_OutOfBandPrint
 Sends a data message in an out-of-band datagram (only used for "connect")
 ================
 */
-void QDECL NET_OutOfBandData( netsrc_t sock, netadr_t adr, byte *format, int len ) {
+void QDECL NET_OutOfBandData( netsrc_t sock, const netadr_t *adr, byte *format, int len ) {
 	byte		string[MAX_MSGLEN*2];
 	int			i;
 	msg_t		mbuf;
@@ -624,6 +746,9 @@ NET_StringToAdr
 
 Traps "localhost" for loopback, passes everything else to system
 return 0 on address not found, 1 on address found with port, 2 on address found without port.
+
+Address family NA_SCION_IP and NA_SCION_IP6 can both resolve to either IPv4 or IPv6 addresses
+over SCION.
 =============
 */
 int NET_StringToAdr( const char *s, netadr_t *a, netadrtype_t family )
@@ -638,8 +763,42 @@ int NET_StringToAdr( const char *s, netadr_t *a, netadrtype_t family )
 		return 1;
 	}
 
+	if (family == NA_SCION_IP || family == NA_SCION_IP6 || family == NA_UNSPEC)
+	{
+		PanUDPAddr resolved = PAN_INVALID_HANDLE;
+		if (PanResolveUDPAddr(s, &resolved) == PAN_ERR_OK)
+		{
+			uint64_t ia;
+			PanUDPAddrGetIA(resolved, &ia);
+			memcpy(a->isd, &ia, 2);
+			memcpy(a->asn, ((byte*)&ia + 2), 6);
+
+			if (!PanUDPAddrIsIPv6(resolved)) {
+				a->type = NA_SCION_IP;
+				PanUDPAddrGetIPv4(resolved, a->ip);
+				memset(a->ip6, 0, 16);
+			} else {
+				a->type = NA_SCION_IP6;
+				PanUDPAddrGetIPv6(resolved, a->ip6);
+				memset(a->ip, 0, 4);
+			}
+
+			a->port = BigShort(PanUDPAddrGetPort(resolved));
+
+			PanDeleteHandle(resolved);
+
+			return a->port != 0 ? 1 : 2;
+		}
+		else if (family != NA_UNSPEC)
+		{
+			a->type = NA_BAD;
+			return 0;
+		}
+		// try again as direct IP if address family was UNSPEC
+	}
+
 	Q_strncpyz( base, s, sizeof( base ) );
-	
+
 	if(*base == '[' || Q_CountChar(base, ':') > 1)
 	{
 		// This is an ipv6 address, handle it specially.
@@ -652,7 +811,7 @@ int NET_StringToAdr( const char *s, netadr_t *a, netadrtype_t family )
 			if(*search == ':')
 				port = search + 1;
 		}
-		
+
 		if(*base == '[')
 			search = base + 1;
 		else
@@ -662,12 +821,12 @@ int NET_StringToAdr( const char *s, netadr_t *a, netadrtype_t family )
 	{
 		// look for a port number
 		port = strchr( base, ':' );
-		
+
 		if ( port ) {
 			*port = '\0';
 			port++;
 		}
-		
+
 		search = base;
 	}
 

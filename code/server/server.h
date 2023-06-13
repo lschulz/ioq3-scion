@@ -51,7 +51,7 @@ typedef struct voipServerPacket_s
 typedef struct svEntity_s {
 	struct worldSector_s *worldSector;
 	struct svEntity_s *nextEntityInWorldSector;
-	
+
 	entityState_t	baseline;		// for delta compression of initial sighting
 	int			numClusters;		// if -1, use headnode instead
 	int			clusternums[MAX_ENT_CLUSTERS];
@@ -74,7 +74,7 @@ typedef struct {
 	int				checksumFeed;		// the feed key that we use to compute the pure checksum strings
 	// https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=475
 	// the serverId associated with the current checksumFeed (always <= serverId)
-	int       checksumFeedServerId;	
+	int       checksumFeedServerId;
 	int				snapshotCounter;	// incremented for each snapshot built
 	int				timeResidual;		// <= 1000 / sv_frame->value
 	int				nextFrameTime;		// when time > nextFrameTime, process world
@@ -195,7 +195,7 @@ typedef struct client_s {
 
 	int				oldServerTime;
 	qboolean		csUpdated[MAX_CONFIGSTRINGS];
-	
+
 #ifdef LEGACY_PROTOCOL
 	qboolean		compat;
 #endif
@@ -245,6 +245,11 @@ typedef struct {
 	netadr_t	authorizeAddress;			// authorize server address
 #endif
 	int			masterResolveTime[MAX_MASTER_SERVERS]; // next svs.time that server should do dns lookup for master server
+#ifdef USE_LIBSODIUM
+	char publicKeyBase64[sodium_base64_ENCODED_LEN(crypto_kx_PUBLICKEYBYTES, sodium_base64_VARIANT_ORIGINAL)];
+	byte publicKey[crypto_kx_PUBLICKEYBYTES];
+	byte secretKey[crypto_kx_SECRETKEYBYTES];
+#endif
 } serverStatic_t;
 
 #define SERVER_MAXBANS	1024
@@ -254,7 +259,7 @@ typedef struct
 	netadr_t ip;
 	// For a CIDR-Notation type suffix
 	int subnet;
-	
+
 	qboolean isexception;
 } serverBan_t;
 
@@ -295,6 +300,9 @@ extern	cvar_t	*sv_lanForceRate;
 extern	cvar_t	*sv_strictAuth;
 #endif
 extern	cvar_t	*sv_banFile;
+#ifdef USE_LIBSODIUM
+extern  cvar_t	*sv_encryption;
+#endif
 
 extern	serverBan_t serverBans[SERVER_MAXBANS];
 extern	int serverBansCount;
@@ -314,6 +322,9 @@ typedef struct leakyBucket_s leakyBucket_t;
 struct leakyBucket_s {
 	netadrtype_t	type;
 
+	byte isd[2]; // SCION
+	byte asn[6]; // SCION
+
 	union {
 		byte	_4[4];
 		byte	_6[16];
@@ -330,7 +341,7 @@ struct leakyBucket_s {
 extern leakyBucket_t outboundLeakyBucket;
 
 qboolean SVC_RateLimit( leakyBucket_t *bucket, int burst, int period );
-qboolean SVC_RateLimitAddress( netadr_t from, int burst, int period );
+qboolean SVC_RateLimitAddress( const netadr_t *from, int burst, int period );
 
 void SV_FinalMessage (char *message);
 void QDECL SV_SendServerCommand( client_t *cl, const char *fmt, ...) __attribute__ ((format (printf, 2, 3)));
@@ -363,12 +374,12 @@ void SV_SpawnServer( char *server, qboolean killBots );
 //
 // sv_client.c
 //
-void SV_GetChallenge(netadr_t from);
+void SV_GetChallenge(const netadr_t *from);
 
-void SV_DirectConnect( netadr_t from );
+void SV_DirectConnect( const netadr_t *from );
 
 #ifndef STANDALONE
-void SV_AuthorizeIpPacket( netadr_t from );
+void SV_AuthorizeIpPacket( const netadr_t *from );
 #endif
 
 void SV_ExecuteClientMessage( client_t *cl, msg_t *msg );

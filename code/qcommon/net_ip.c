@@ -91,6 +91,11 @@ typedef int	ioctlarg_t;
 
 #endif
 
+#include <sys/un.h>
+
+PanSelector NET_PathSelInit(void);
+void NET_PathSelDestroy(void);
+
 static qboolean usingSocks = qfalse;
 static int networkingEnabled = 0;
 
@@ -104,12 +109,15 @@ static cvar_t	*net_socksPassword;
 
 static cvar_t	*net_ip;
 static cvar_t	*net_ip6;
+static cvar_t   *net_scion;
 static cvar_t	*net_port;
 static cvar_t	*net_port6;
+static cvar_t   *net_scion_port;
 static cvar_t	*net_mcast6addr;
 static cvar_t	*net_mcast6iface;
 
 static cvar_t	*net_dropsim;
+static cvar_t   *net_oobTimeout;
 
 static struct sockaddr	socksRelayAddr;
 
@@ -117,6 +125,30 @@ static SOCKET	ip_socket = INVALID_SOCKET;
 static SOCKET	ip6_socket = INVALID_SOCKET;
 static SOCKET	socks_socket = INVALID_SOCKET;
 static SOCKET	multicast6_socket = INVALID_SOCKET;
+
+// SCION server side connection (not connected)
+static PanListenConn		scion_server_conn = PAN_INVALID_HANDLE;
+static PanListenSockAdapter	scion_server_adapter = PAN_INVALID_HANDLE;
+static SOCKET				scion_server_socket = INVALID_SOCKET;
+
+// SCION client side connection (connected to scion_client_remote)
+static netadr_t				scion_client_remote = {0};
+static PanConn				scion_client_conn = PAN_INVALID_HANDLE;
+static PanConnSockAdapter	scion_client_adapter = PAN_INVALID_HANDLE;
+static SOCKET				scion_client_socket = INVALID_SOCKET;
+
+// Pool of temporary SCION sockets for out-of-band messages that cannot be
+// handled by scion_server or scion_client connections.
+#define MAX_OOB_CONNECTIONS 32
+typedef struct
+{
+	netadr_t			adr;		// remote address, NA_BAD if slot is not in use
+	int					last;		// time the connection was last used
+	PanConn				conn;		// PAN connection
+	PanConnSockAdapter	adapter;	// Unix socket adapter
+	SOCKET				socket;		// Unix socket
+} scion_oob_t;
+static scion_oob_t scion_oob[MAX_OOB_CONNECTIONS] = {0};
 
 // Keep track of currently joined multicast group.
 static struct ipv6_mreq curgroup;
@@ -135,7 +167,7 @@ static struct sockaddr_in6 boundto;
 typedef struct
 {
 	char ifname[IF_NAMESIZE];
-	
+
 	netadrtype_t type;
 	sa_family_t family;
 	struct sockaddr_storage addr;
@@ -209,7 +241,7 @@ char *NET_ErrorString( void ) {
 #endif
 }
 
-static void NetadrToSockadr( netadr_t *a, struct sockaddr *s ) {
+static void NetadrToSockadr( const netadr_t *a, struct sockaddr *s ) {
 	if( a->type == NA_BROADCAST ) {
 		((struct sockaddr_in *)s)->sin_family = AF_INET;
 		((struct sockaddr_in *)s)->sin_port = a->port;
@@ -251,6 +283,40 @@ static void SockadrToNetadr( struct sockaddr *s, netadr_t *a ) {
 }
 
 
+static qboolean ParsePanProxyHdr(byte *header, netadr_t *addr)
+{
+	memcpy(addr->isd, header, 2);
+	memcpy(addr->asn, &header[2], 6);
+
+	uint32_t addr_len = *(uint32_t*)&header[8];
+
+	if (addr_len == 4)
+	{
+		addr->type = NA_SCION_IP;
+		memcpy(addr->ip, &header[12], 4);
+		memset(addr->ip6, 0, 16);
+	}
+	else if (addr_len == 16)
+	{
+		addr->type = NA_SCION_IP6;
+		memset(addr->ip, 0, 4);
+		memcpy(addr->ip6, &header[12], 16);
+		addr->scope_id = 0;
+	}
+	else
+	{
+		Com_Printf("Invalid PAN proxy header\n");
+		addr->type = NA_BAD;
+		return qfalse;
+	}
+
+	// Port is stored as little endian in proxy header and as big-endian in netadr_t
+	addr->port = ((uint16_t)header[28] << 8) | (uint16_t)header[29];
+
+	return qtrue;
+}
+
+
 static struct addrinfo *SearchAddrInfo(struct addrinfo *hints, sa_family_t family)
 {
 	while(hints)
@@ -260,7 +326,7 @@ static struct addrinfo *SearchAddrInfo(struct addrinfo *hints, sa_family_t famil
 
 		hints = hints->ai_next;
 	}
-	
+
 	return NULL;
 }
 
@@ -276,14 +342,14 @@ static qboolean Sys_StringToSockaddr(const char *s, struct sockaddr *sadr, int s
 	struct addrinfo *search = NULL;
 	struct addrinfo *hintsp;
 	int retval;
-	
+
 	memset(sadr, '\0', sizeof(*sadr));
 	memset(&hints, '\0', sizeof(hints));
 
 	hintsp = &hints;
 	hintsp->ai_family = family;
 	hintsp->ai_socktype = SOCK_DGRAM;
-	
+
 	retval = getaddrinfo(s, NULL, hintsp, &res);
 
 	if(!retval)
@@ -295,7 +361,7 @@ static qboolean Sys_StringToSockaddr(const char *s, struct sockaddr *sadr, int s
 			{
 				if(net_enabled->integer & NET_ENABLEV6)
 					search = SearchAddrInfo(res, AF_INET6);
-				
+
 				if(!search && (net_enabled->integer & NET_ENABLEV4))
 					search = SearchAddrInfo(res, AF_INET);
 			}
@@ -303,7 +369,7 @@ static qboolean Sys_StringToSockaddr(const char *s, struct sockaddr *sadr, int s
 			{
 				if(net_enabled->integer & NET_ENABLEV4)
 					search = SearchAddrInfo(res, AF_INET);
-				
+
 				if(!search && (net_enabled->integer & NET_ENABLEV6))
 					search = SearchAddrInfo(res, AF_INET6);
 			}
@@ -315,10 +381,10 @@ static qboolean Sys_StringToSockaddr(const char *s, struct sockaddr *sadr, int s
 		{
 			if(search->ai_addrlen > sadr_len)
 				search->ai_addrlen = sadr_len;
-				
+
 			memcpy(sadr, search->ai_addr, search->ai_addrlen);
 			freeaddrinfo(res);
-			
+
 			return qtrue;
 		}
 		else
@@ -326,10 +392,10 @@ static qboolean Sys_StringToSockaddr(const char *s, struct sockaddr *sadr, int s
 	}
 	else
 		Com_Printf("Sys_StringToSockaddr: Error resolving %s: %s\n", s, gai_strerror(retval));
-	
+
 	if(res)
 		freeaddrinfo(res);
-	
+
 	return qfalse;
 }
 
@@ -354,12 +420,17 @@ static void Sys_SockaddrToString(char *dest, int destlen, struct sockaddr *input
 /*
 =============
 Sys_StringToAdr
+
+Does not support SCION addresses.
 =============
 */
-qboolean Sys_StringToAdr( const char *s, netadr_t *a, netadrtype_t family ) {
+qboolean Sys_StringToAdr(const char *s, netadr_t *a, netadrtype_t family)
+{
+	assert(family != NA_SCION_IP && family != NA_SCION_IP6);
+
 	struct sockaddr_storage sadr;
 	sa_family_t fam;
-	
+
 	switch(family)
 	{
 		case NA_IP:
@@ -375,7 +446,7 @@ qboolean Sys_StringToAdr( const char *s, netadr_t *a, netadrtype_t family ) {
 	if( !Sys_StringToSockaddr(s, (struct sockaddr *) &sadr, sizeof(sadr), fam ) ) {
 		return qfalse;
 	}
-	
+
 	SockadrToNetadr( (struct sockaddr *) &sadr, a );
 	return qtrue;
 }
@@ -387,30 +458,36 @@ NET_CompareBaseAdrMask
 Compare without port, and up to the bit number given in netmask.
 ===================
 */
-qboolean NET_CompareBaseAdrMask(netadr_t a, netadr_t b, int netmask)
+qboolean NET_CompareBaseAdrMask(const netadr_t *a, const netadr_t *b, int netmask)
 {
 	byte cmpmask, *addra, *addrb;
 	int curbyte;
-	
-	if (a.type != b.type)
+
+	if (a->type != b->type)
 		return qfalse;
 
-	if (a.type == NA_LOOPBACK)
+	if (a->type == NA_LOOPBACK)
 		return qtrue;
 
-	if(a.type == NA_IP)
+	if (a->type == NA_SCION_IP || a->type == NA_SCION_IP6)
 	{
-		addra = (byte *) &a.ip;
-		addrb = (byte *) &b.ip;
-		
+		if (memcmp(a->isd, b->isd, 2) || memcmp(a->asn, b->asn, 6))
+			return qfalse;
+	}
+
+	if(a->type == NA_IP || a->type == NA_SCION_IP)
+	{
+		addra = (byte *) &a->ip;
+		addrb = (byte *) &b->ip;
+
 		if(netmask < 0 || netmask > 32)
 			netmask = 32;
 	}
-	else if(a.type == NA_IP6)
+	else if(a->type == NA_IP6 || a->type == NA_SCION_IP6)
 	{
-		addra = (byte *) &a.ip6;
-		addrb = (byte *) &b.ip6;
-		
+		addra = (byte *) &a->ip6;
+		addrb = (byte *) &b->ip6;
+
 		if(netmask < 0 || netmask > 128)
 			netmask = 128;
 	}
@@ -436,7 +513,7 @@ qboolean NET_CompareBaseAdrMask(netadr_t a, netadr_t b, int netmask)
 	}
 	else
 		return qtrue;
-	
+
 	return qfalse;
 }
 
@@ -448,67 +525,492 @@ NET_CompareBaseAdr
 Compares without the port
 ===================
 */
-qboolean NET_CompareBaseAdr (netadr_t a, netadr_t b)
+qboolean NET_CompareBaseAdr(const netadr_t *a, const netadr_t *b)
 {
 	return NET_CompareBaseAdrMask(a, b, -1);
 }
 
-const char	*NET_AdrToString (netadr_t a)
+const char	*NET_AdrToString (const netadr_t *a)
 {
 	static	char	s[NET_ADDRSTRMAXLEN];
 
-	if (a.type == NA_LOOPBACK)
+	if (a->type == NA_LOOPBACK)
 		Com_sprintf (s, sizeof(s), "loopback");
-	else if (a.type == NA_BOT)
+	else if (a->type == NA_BOT)
 		Com_sprintf (s, sizeof(s), "bot");
-	else if (a.type == NA_IP || a.type == NA_IP6)
+	else if (a->type == NA_IP || a->type == NA_IP6)
 	{
 		struct sockaddr_storage sadr;
-	
+
 		memset(&sadr, 0, sizeof(sadr));
-		NetadrToSockadr(&a, (struct sockaddr *) &sadr);
+		NetadrToSockadr(a, (struct sockaddr *) &sadr);
 		Sys_SockaddrToString(s, sizeof(s), (struct sockaddr *) &sadr);
+	}
+	else if (a->type == NA_SCION_IP || a->type == NA_SCION_IP6)
+	{
+		ssize_t offset = 0;
+		const ssize_t len = sizeof(s);
+
+		int ret = Com_sprintf(s, len, "%hu-%hx:%hx:%hx,",
+			(uint16_t)(a->isd[0] << 8) | (uint16_t)a->isd[1],
+			(uint16_t)(a->asn[0] << 8) | (uint16_t)a->asn[1],
+			(uint16_t)(a->asn[2] << 8) | (uint16_t)a->asn[3],
+			(uint16_t)(a->asn[4] << 8) | (uint16_t)a->asn[5]);
+		if (ret > 0) offset += ret;
+
+		if (a->type == NA_SCION_IP)
+		{
+			ret = Com_sprintf(s + offset, len - offset, "%hhu.%hhu.%hhu.%hhu",
+				a->ip[0], a->ip[1], a->ip[2], a->ip[3]);
+			if (ret > 0) offset += ret;
+		}
+		else
+		{
+			ret = Com_sprintf(s + offset, len - offset,
+				"[%04hx:%04hx:%04hx:%04hx:%04hx:%04hx:%04hx:%04hx]",
+				ntohs(*(uint16_t*)&a->ip[ 0]), ntohs(*(uint16_t*)&a->ip[ 2]),
+				ntohs(*(uint16_t*)&a->ip[ 4]), ntohs(*(uint16_t*)&a->ip[ 6]),
+				ntohs(*(uint16_t*)&a->ip[ 8]), ntohs(*(uint16_t*)&a->ip[10]),
+				ntohs(*(uint16_t*)&a->ip[12]), ntohs(*(uint16_t*)&a->ip[14]));
+			if (ret > 0) offset += ret;
+		}
 	}
 
 	return s;
 }
 
-const char	*NET_AdrToStringwPort (netadr_t a)
+const char	*NET_AdrToStringwPort (const netadr_t *a)
 {
 	static	char	s[NET_ADDRSTRMAXLEN];
 
-	if (a.type == NA_LOOPBACK)
+	if (a->type == NA_LOOPBACK)
 		Com_sprintf (s, sizeof(s), "loopback");
-	else if (a.type == NA_BOT)
+	else if (a->type == NA_BOT)
 		Com_sprintf (s, sizeof(s), "bot");
-	else if(a.type == NA_IP)
-		Com_sprintf(s, sizeof(s), "%s:%hu", NET_AdrToString(a), ntohs(a.port));
-	else if(a.type == NA_IP6)
-		Com_sprintf(s, sizeof(s), "[%s]:%hu", NET_AdrToString(a), ntohs(a.port));
+	else if(a->type == NA_IP || a->type == NA_SCION_IP || a->type == NA_SCION_IP6)
+		Com_sprintf(s, sizeof(s), "%s:%hu", NET_AdrToString(a), ntohs(a->port));
+	else if(a->type == NA_IP6)
+		Com_sprintf(s, sizeof(s), "[%s]:%hu", NET_AdrToString(a), ntohs(a->port));
 
 	return s;
 }
 
 
-qboolean	NET_CompareAdr (netadr_t a, netadr_t b)
+qboolean	NET_CompareAdr(const netadr_t *a, const netadr_t *b)
 {
 	if(!NET_CompareBaseAdr(a, b))
 		return qfalse;
-	
-	if (a.type == NA_IP || a.type == NA_IP6)
+
+	if (a->type == NA_IP || a->type == NA_IP6 || a->type == NA_SCION_IP || a->type == NA_SCION_IP6)
 	{
-		if (a.port == b.port)
+		if (a->port == b->port)
 			return qtrue;
 	}
 	else
 		return qtrue;
-		
+
 	return qfalse;
 }
 
 
-qboolean	NET_IsLocalAddress( netadr_t adr ) {
-	return adr.type == NA_LOOPBACK;
+qboolean	NET_IsLocalAddress(const netadr_t *adr)
+{
+	return adr->type == NA_LOOPBACK;
+}
+
+//=============================================================================
+
+/*
+====================
+NET_GetLocalForPan
+
+Get the local address for PAN connections.
+====================
+*/
+void NET_GetLocalForPan(char *addr, int size, int offset)
+{
+	if (strchr(net_scion->string, ':'))
+	{
+		// Probably an IPv6 address
+		Com_sprintf(addr, size, "[%s]:%d", net_scion->string, net_scion_port->integer + offset);
+	}
+	else
+	{
+		// Probably an IPv4 address
+		Com_sprintf(addr, size, "%s:%d", net_scion->string, net_scion_port->integer + offset);
+	}
+}
+
+/*
+==================
+NET_AddressToPan
+
+Create an address handle for the PAN API from a netadr.
+==================
+*/
+PanUDPAddr NET_AddressToPan(const netadr_t *to)
+{
+	uint8_t ia[8];
+	memcpy(&ia[0], to->isd, 2);
+	memcpy(&ia[2], to->asn, 6);
+	if (to->type == NA_SCION_IP)
+		return PanUDPAddrNew((uint64_t*)ia, to->ip, 4, ShortSwap(to->port));
+	else
+		return PanUDPAddrNew((uint64_t*)ia, to->ip6, 16, ShortSwap(to->port));
+}
+
+/*
+====================
+NET_PanUnixSocket
+
+Create a Unix domain socket pair for asnchronous communication with PAN.
+====================
+*/
+static qboolean NET_PanUnixSocket(
+	uintptr_t conn, const char *pan_addr, const char *local_addr,
+	uintptr_t *pan_sock, SOCKET *sock, qboolean listen)
+{
+	PanError err = PAN_ERR_OK;
+	ioctlarg_t _true = 1;
+
+	// Create PAN end of unix socket pair
+	if (listen) {
+		err = PanNewListenSockAdapter(conn, pan_addr, local_addr, pan_sock);
+		if (err) {
+			Com_Printf("WARNING: NET_PanUnixSocket: PanNewListenSockAdapter failed (%d)\n", err);
+			return qfalse;
+		}
+	} else {
+		err = PanNewConnSockAdapter(conn, pan_addr, local_addr, pan_sock);
+		if (err) {
+			Com_Printf("WARNING: NET_PanUnixSocket: PanNewConnSockAdapter failed (%d)\n", err);
+			goto pan_cleanup;
+		}
+	}
+
+	// Create C end of Unix socket pair
+	*sock = socket(PF_UNIX, SOCK_DGRAM, 0);
+	if (*sock == INVALID_SOCKET) {
+		Com_Printf("WARNING: NET_PanUnixSocket: socket: %s\n", NET_ErrorString());
+		goto pan_cleanup;
+	}
+
+	// Make domain socket non-blocking
+	if (ioctlsocket(*sock, FIONBIO, &_true) == SOCKET_ERROR) {
+		Com_Printf("WARNING: NET_PanUnixSocket: ioctl FIONBIO: %s\n", NET_ErrorString());
+		goto socket_cleanup;
+	}
+
+	// Bind C socket
+	unlink(local_addr);
+	struct sockaddr_un local;
+	local.sun_family = AF_UNIX;
+	Q_strncpyz (local.sun_path, local_addr, sizeof(local.sun_path));
+	if (bind(*sock, (struct sockaddr*)&local, sizeof(local)) == SOCKET_ERROR) {
+		Com_Printf("WARNING: NET_PanUnixSocket: bind: %s\n", NET_ErrorString());
+		goto socket_cleanup;
+	}
+
+	// Connect our socket to the PAN socket so we can use plain send()
+	struct sockaddr_un sockaddr;
+	sockaddr.sun_family = AF_UNIX;
+	Q_strncpyz (sockaddr.sun_path, pan_addr, sizeof(sockaddr.sun_path));
+	if (connect(*sock, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) == SOCKET_ERROR) {
+		Com_Printf("WARNING: NET_PanUnixSocket: connect: %s\n", NET_ErrorString());
+		goto socket_cleanup;
+	}
+
+	return qtrue;
+
+socket_cleanup:
+	closesocket(*sock);
+	*sock = INVALID_SOCKET;
+pan_cleanup:
+	if (listen)
+		PanListenSockAdapterClose(*pan_sock);
+	else
+		PanConnSockAdapterClose(*pan_sock);
+	PanDeleteHandle(*pan_sock);
+	*pan_sock = PAN_INVALID_HANDLE;
+	return qfalse;
+}
+
+/*
+====================
+NET_ClearOOBSlot
+====================
+*/
+static void NET_ClearOOBSlot(int i)
+{
+	char path[MAX_OSPATH] = {0};
+
+	if (scion_oob[i].adr.type == NA_BAD)
+		return;
+
+	if (scion_oob[i].socket)
+	{
+		closesocket(scion_oob[i].socket);
+		Com_sprintf(path, sizeof(path), "/tmp/ioquake3_%d_oob_%d.sock", getpid(), i);
+		unlink(path);
+	}
+	if (scion_oob[i].adapter)
+	{
+		PanConnSockAdapterClose(scion_oob[i].adapter);
+		PanDeleteHandle(scion_oob[i].adapter);
+	}
+	if (scion_oob[i].conn)
+	{
+		PanConnClose(scion_oob[i].conn);
+		PanDeleteHandle(scion_oob[i].conn);
+	}
+
+	Com_Memset(&scion_oob[i], 0, sizeof(scion_oob_t));
+}
+
+/*
+====================
+NET_OpenOOBConn
+====================
+*/
+static int NET_OpenOOBConn(const netadr_t *to)
+{
+	PanError err = PAN_ERR_OK;
+	char local[NET_ADDRSTRMAXLEN] = {0};
+	char pan_addr[MAX_OSPATH] = {0};
+	char loc_addr[MAX_OSPATH] = {0};
+
+	if (to->type != NA_SCION_IP && to->type != NA_SCION_IP6)
+		return -1;
+
+	// Find a free slot or clear out the least recently used
+	scion_oob_t *slot = NULL;
+	int i = 0, lru = 0;
+	for (; i < MAX_OOB_CONNECTIONS; ++i)
+	{
+		if (scion_oob[i].adr.type == NA_BAD)
+		{
+			slot = &scion_oob[i];
+			break;
+		}
+		if (scion_oob[i].last < scion_oob[lru].last)
+			lru = i;
+	}
+	if (!slot) {
+		i = lru;
+		NET_ClearOOBSlot(i);
+		slot = &scion_oob[i];
+	}
+
+	// Open connection
+	slot->adr = *to;
+	slot->last = Sys_Milliseconds();
+	NET_GetLocalForPan(local, sizeof(local), 2 + i);
+	PanUDPAddr addr = NET_AddressToPan(to);
+	err = PanDialUDP(local, addr, PAN_INVALID_HANDLE, PAN_INVALID_HANDLE, &slot->conn);
+	PanDeleteHandle(addr);
+	if (err)
+	{
+		NET_ClearOOBSlot(i);
+		return -1;
+	}
+
+	pid_t pid = getpid();
+	Com_sprintf(pan_addr, sizeof(pan_addr), "/tmp/ioquake3_%d_oob_pan_%d.sock", pid, i);
+	Com_sprintf(loc_addr, sizeof(loc_addr), "/tmp/ioquake3_%d_oob_%d.sock", pid, i);
+	if (!NET_PanUnixSocket(slot->conn, pan_addr, loc_addr, &slot->adapter, &slot->socket, qfalse))
+	{
+		NET_ClearOOBSlot(i);
+		return -1;
+	}
+
+	return i;
+};
+
+/*
+====================
+NET_PanListenUDP
+
+Listen on a SCION UDP socket.
+====================
+*/
+static PanListenConn NET_PanListenUDP(char *listen_addr)
+{
+	PanListenConn listen_conn = PAN_INVALID_HANDLE;
+
+	PanError err = PanListenUDP(listen_addr, PAN_INVALID_HANDLE, &listen_conn);
+	if (err) return PAN_INVALID_HANDLE;
+
+	PanUDPAddr boundto = PanListenConnLocalAddr(listen_conn);
+	char *addr = PanUDPAddrToString(boundto);
+	if (addr) Com_Printf("Opening SCION socket: %s\n", addr);
+	free(addr);
+	PanDeleteHandle(boundto);
+
+	return listen_conn;
+}
+
+/*
+====================
+NET_ScionServerStart
+
+Start listening for SCION packets on the server port.
+====================
+*/
+void NET_ScionServerStart(void)
+{
+	char local[NET_ADDRSTRMAXLEN] = {0};
+	char pan_addr[MAX_OSPATH] = {0};
+	char loc_addr[MAX_OSPATH] = {0};
+
+	if(!(net_enabled->integer & NET_ENABLE_SCION))
+		return;
+
+	if (scion_server_conn == PAN_INVALID_HANDLE)
+	{
+		NET_GetLocalForPan(local, sizeof(local), 0);
+		scion_server_conn = NET_PanListenUDP(local);
+		if (scion_server_conn == PAN_INVALID_HANDLE)
+		{
+			Com_Printf( "WARNING: Couldn't bind to a SCION address.\n");
+			return;
+		}
+	}
+
+	if (scion_server_adapter == PAN_INVALID_HANDLE && scion_server_socket == INVALID_SOCKET)
+	{
+		pid_t pid = getpid();
+		Com_sprintf(pan_addr, sizeof(pan_addr), "/tmp/ioquake3_%d_server_pan.sock", pid);
+		Com_sprintf(loc_addr, sizeof(loc_addr), "/tmp/ioquake3_%d_server.sock", pid);
+		if (!NET_PanUnixSocket(scion_server_conn, pan_addr, loc_addr,
+				&scion_server_adapter, &scion_server_socket, qtrue)) {
+			Com_Printf( "WARNING: Couldn't create PAN domain socket pair.\n");
+			PanListenConnClose(scion_server_conn);
+			PanDeleteHandle(scion_server_conn);
+			scion_server_conn = PAN_INVALID_HANDLE;
+		}
+	}
+}
+
+/*
+====================
+NET_ScionServerStop
+
+Stop listening for SCION packets on the server port.
+====================
+*/
+void NET_ScionServerStop(void)
+{
+	char path[MAX_OSPATH] = {0};
+
+	if ( scion_server_socket != INVALID_SOCKET ) {
+		closesocket( scion_server_socket );
+		scion_server_socket = INVALID_SOCKET;
+		Com_sprintf(path, sizeof(path), "/tmp/ioquake3_%d_server.sock", getpid());
+		unlink(path);
+	}
+
+	if ( scion_server_adapter != PAN_INVALID_HANDLE ) {
+		PanListenSockAdapterClose( scion_server_adapter );
+		PanDeleteHandle ( scion_server_adapter );
+		scion_server_adapter = PAN_INVALID_HANDLE;
+	}
+
+	if ( scion_server_conn != PAN_INVALID_HANDLE ) {
+		Com_Printf("Closing SCION socket.\n");
+		PanListenConnClose( scion_server_conn );
+		PanDeleteHandle( scion_server_conn );
+		scion_server_conn = PAN_INVALID_HANDLE;
+	}
+}
+
+/*
+====================
+NET_ScionClientConnect
+
+Open a PAN connection to a server for the client subsystem.
+====================
+*/
+qboolean NET_ScionClientConnect(const netadr_t *to)
+{
+	PanError err = PAN_ERR_OK;
+	char local[NET_ADDRSTRMAXLEN] = {0};
+	char pan_addr[MAX_OSPATH];
+	char loc_addr[MAX_OSPATH];
+
+	if (!(net_enabled->integer & NET_ENABLE_SCION))
+		return qfalse;
+	if (scion_client_conn != PAN_INVALID_HANDLE)
+		NET_ScionClientClose();
+
+	PanUDPAddr remote = NET_AddressToPan(to);
+	if (remote == PAN_INVALID_HANDLE)
+		return qfalse;
+
+	PanSelector sel = NET_PathSelInit();
+	if (sel == PAN_INVALID_HANDLE)
+	{
+		PanDeleteHandle(remote);
+		return qfalse;
+	}
+
+	// Dial SCION
+	NET_GetLocalForPan(local, sizeof(local), 0);
+	err = PanDialUDP(local, remote, PAN_INVALID_HANDLE, sel, &scion_client_conn);
+	PanDeleteHandle(remote);
+	if (err) {
+		Com_Printf("WARNING: NET_ScionClientConnect: PanDialUDP failed (%d)\n", err);
+		return qfalse;
+	}
+
+	// Create Unix socket pair for dialed PAN connection.
+	pid_t pid = getpid();
+	Com_sprintf(pan_addr, sizeof(pan_addr), "/tmp/ioquake3_client_pan_%d.sock", pid);
+	Com_sprintf(loc_addr, sizeof(loc_addr), "/tmp/ioquake3_client_%d.sock", pid);
+	if (!NET_PanUnixSocket(scion_client_conn, pan_addr, loc_addr,
+		 &scion_client_adapter, &scion_client_socket, qfalse)) {
+		PanConnClose(scion_client_conn);
+		PanDeleteHandle(scion_client_conn);
+		scion_client_conn = PAN_INVALID_HANDLE;
+		return qfalse;
+	}
+
+	scion_client_remote = *to;
+	return qtrue;
+}
+
+/*
+====================
+NET_ScionClientClose
+
+Disconnect the client subsystem's PAN connection.
+====================
+*/
+void NET_ScionClientClose(void)
+{
+	char path[MAX_OSPATH] = {0};
+
+	if (scion_client_socket) {
+		closesocket(scion_client_socket);
+		scion_client_socket = INVALID_SOCKET;
+		Com_sprintf(path, sizeof(path), "/tmp/ioquake3_client_%d.sock", getpid());
+		unlink(path);
+	}
+
+	if (scion_client_adapter != PAN_INVALID_HANDLE) {
+		PanConnSockAdapterClose(scion_client_adapter);
+		PanDeleteHandle(scion_client_adapter);
+		scion_client_adapter = PAN_INVALID_HANDLE;
+	}
+
+	if ( scion_client_conn != PAN_INVALID_HANDLE ) {
+		PanConnClose(scion_client_conn);
+		PanDeleteHandle(scion_client_conn);
+		scion_client_conn = PAN_INVALID_HANDLE;
+	}
+
+	NET_PathSelDestroy();
+
+	Com_Memset(&scion_client_remote, 0, sizeof(scion_client_remote));
 }
 
 //=============================================================================
@@ -526,12 +1028,12 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 	struct sockaddr_storage from;
 	socklen_t	fromlen;
 	int		err;
-	
+
 	if(ip_socket != INVALID_SOCKET && FD_ISSET(ip_socket, fdr))
 	{
 		fromlen = sizeof(from);
 		ret = recvfrom( ip_socket, (void *)net_message->data, net_message->maxsize, 0, (struct sockaddr *) &from, &fromlen );
-		
+
 		if (ret == SOCKET_ERROR)
 		{
 			err = socketError;
@@ -543,7 +1045,7 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 		{
 
 			memset( ((struct sockaddr_in *)&from)->sin_zero, 0, 8 );
-		
+
 			if ( usingSocks && memcmp( &from, &socksRelayAddr, fromlen ) == 0 ) {
 				if ( ret < 10 || net_message->data[0] != 0 || net_message->data[1] != 0 || net_message->data[2] != 0 || net_message->data[3] != 1 ) {
 					return qfalse;
@@ -560,22 +1062,22 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 				SockadrToNetadr( (struct sockaddr *) &from, net_from );
 				net_message->readcount = 0;
 			}
-		
+
 			if( ret >= net_message->maxsize ) {
-				Com_Printf( "Oversize packet from %s\n", NET_AdrToString (*net_from) );
+				Com_Printf( "Oversize packet from %s\n", NET_AdrToString (net_from) );
 				return qfalse;
 			}
-			
+
 			net_message->cursize = ret;
 			return qtrue;
 		}
 	}
-	
+
 	if(ip6_socket != INVALID_SOCKET && FD_ISSET(ip6_socket, fdr))
 	{
 		fromlen = sizeof(from);
 		ret = recvfrom(ip6_socket, (void *)net_message->data, net_message->maxsize, 0, (struct sockaddr *) &from, &fromlen);
-		
+
 		if (ret == SOCKET_ERROR)
 		{
 			err = socketError;
@@ -587,13 +1089,13 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 		{
 			SockadrToNetadr((struct sockaddr *) &from, net_from);
 			net_message->readcount = 0;
-		
+
 			if(ret >= net_message->maxsize)
 			{
-				Com_Printf( "Oversize packet from %s\n", NET_AdrToString (*net_from) );
+				Com_Printf( "Oversize packet from %s\n", NET_AdrToString (net_from) );
 				return qfalse;
 			}
-			
+
 			net_message->cursize = ret;
 			return qtrue;
 		}
@@ -603,7 +1105,7 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 	{
 		fromlen = sizeof(from);
 		ret = recvfrom(multicast6_socket, (void *)net_message->data, net_message->maxsize, 0, (struct sockaddr *) &from, &fromlen);
-		
+
 		if (ret == SOCKET_ERROR)
 		{
 			err = socketError;
@@ -615,19 +1117,113 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 		{
 			SockadrToNetadr((struct sockaddr *) &from, net_from);
 			net_message->readcount = 0;
-		
+
 			if(ret >= net_message->maxsize)
 			{
-				Com_Printf( "Oversize packet from %s\n", NET_AdrToString (*net_from) );
+				Com_Printf( "Oversize packet from %s\n", NET_AdrToString (net_from) );
 				return qfalse;
 			}
-			
+
 			net_message->cursize = ret;
 			return qtrue;
 		}
 	}
-	
-	
+
+	if(scion_server_socket != INVALID_SOCKET && FD_ISSET(scion_server_socket, fdr))
+	{
+		byte packet[MAX_PACKETLEN + PAN_ADDR_HDR_SIZE];
+		ret = recv(scion_server_socket, packet, sizeof(packet), 0);
+
+		if (ret == SOCKET_ERROR)
+		{
+			err = socketError;
+
+			if (err != EAGAIN && err != ECONNRESET)
+				Com_Printf("NET_GetPacket: %s\n", NET_ErrorString());
+
+			return qfalse;
+		}
+		else
+		{
+			if (ret < PAN_ADDR_HDR_SIZE) {
+				Com_Printf("Received invalid header from PAN unix socket\n");
+				return qfalse;
+			}
+
+			int size = ret - PAN_ADDR_HDR_SIZE;
+			memcpy(net_message->data, packet + PAN_ADDR_HDR_SIZE, size);
+			if (!ParsePanProxyHdr(packet, net_from))
+				return qfalse;
+
+			net_message->readcount = 0;
+
+			if (size >= net_message->maxsize) {
+				Com_Printf("Oversize packet from %s\n", NET_AdrToString(net_from));
+				return qfalse;
+			}
+
+			net_message->cursize = size;
+			return qtrue;
+		}
+	}
+
+	if(scion_client_socket != INVALID_SOCKET && FD_ISSET(scion_client_socket, fdr))
+	{
+		ret = recv(scion_client_socket, (void*)net_message->data, net_message->maxsize, 0);
+
+		if (ret == SOCKET_ERROR)
+		{
+			err = socketError;
+
+			if (err != EAGAIN && err != ECONNRESET)
+				Com_Printf("NET_GetPacket: %s\n", NET_ErrorString());
+		}
+		else
+		{
+			*net_from = scion_client_remote;
+			net_message->readcount = 0;
+
+			if (ret >= net_message->maxsize) {
+				Com_Printf("Oversize packet from %s\n", NET_AdrToString(net_from));
+				return qfalse;
+			}
+
+			net_message->cursize = ret;
+			return qtrue;
+		}
+	}
+
+	for (int i = 0; i < MAX_OOB_CONNECTIONS; ++i)
+	{
+		if (scion_oob[i].adr.type == NA_BAD)
+			continue;
+		if (FD_ISSET(scion_oob[i].socket, fdr))
+		{
+			ret = recv(scion_oob[i].socket, (void*)net_message->data, net_message->maxsize, 0);
+
+			if (ret == SOCKET_ERROR)
+			{
+				err = socketError;
+
+				if (err != EAGAIN && err != ECONNRESET)
+					Com_Printf("NET_GetPacket: %s\n", NET_ErrorString());
+			}
+			else
+			{
+				*net_from = scion_oob[i].adr;
+				net_message->readcount = 0;
+
+				if (ret >= net_message->maxsize) {
+					Com_Printf("Oversize packet from %s\n", NET_AdrToString(net_from));
+					return qfalse;
+				}
+
+				net_message->cursize = ret;
+				return qtrue;
+			}
+		}
+	}
+
 	return qfalse;
 }
 
@@ -640,44 +1236,96 @@ static char socksBuf[4096];
 Sys_SendPacket
 ==================
 */
-void Sys_SendPacket( int length, const void *data, netadr_t to ) {
-	int				ret = SOCKET_ERROR;
-	struct sockaddr_storage	addr;
+void Sys_SendPacket( int length, const void *data, const netadr_t *to )
+{
+	int ret = SOCKET_ERROR;
 
-	if( to.type != NA_BROADCAST && to.type != NA_IP && to.type != NA_IP6 && to.type != NA_MULTICAST6)
+	if (to->type != NA_BROADCAST && to->type != NA_IP && to->type != NA_IP6 &&
+		to->type != NA_MULTICAST6 && to->type != NA_SCION_IP && to->type != NA_SCION_IP6)
 	{
 		Com_Error( ERR_FATAL, "Sys_SendPacket: bad address type" );
 		return;
 	}
 
-	if( (ip_socket == INVALID_SOCKET && to.type == NA_IP) ||
-		(ip_socket == INVALID_SOCKET && to.type == NA_BROADCAST) ||
-		(ip6_socket == INVALID_SOCKET && to.type == NA_IP6) ||
-		(ip6_socket == INVALID_SOCKET && to.type == NA_MULTICAST6) )
+	if ((to->type == NA_IP && ip_socket == INVALID_SOCKET) ||
+		(to->type == NA_BROADCAST && ip_socket == INVALID_SOCKET) ||
+		(to->type == NA_IP6 && ip6_socket == INVALID_SOCKET) ||
+		(to->type == NA_MULTICAST6 && ip6_socket == INVALID_SOCKET))
 		return;
 
-	if(to.type == NA_MULTICAST6 && (net_enabled->integer & NET_DISABLEMCAST))
+	if(to->type == NA_MULTICAST6 && (net_enabled->integer & NET_DISABLEMCAST))
 		return;
 
-	memset(&addr, 0, sizeof(addr));
-	NetadrToSockadr( &to, (struct sockaddr *) &addr );
+	if (to->type == NA_SCION_IP || to->type == NA_SCION_IP6)
+	{
+		if (!(net_enabled->integer & NET_ENABLE_SCION))
+			return;
 
-	if( usingSocks && to.type == NA_IP ) {
-		socksBuf[0] = 0;	// reserved
-		socksBuf[1] = 0;
-		socksBuf[2] = 0;	// fragment (not fragmented)
-		socksBuf[3] = 1;	// address type: IPV4
-		*(int *)&socksBuf[4] = ((struct sockaddr_in *)&addr)->sin_addr.s_addr;
-		*(short *)&socksBuf[8] = ((struct sockaddr_in *)&addr)->sin_port;
-		memcpy( &socksBuf[10], data, length );
-		ret = sendto( ip_socket, socksBuf, length+10, 0, &socksRelayAddr, sizeof(socksRelayAddr) );
+		qboolean sent = qfalse;
+		if (scion_client_socket && NET_CompareBaseAdr(to, &scion_client_remote))
+		{
+			ret = send(scion_client_socket, data, length, 0);
+			sent = qtrue;
+		}
+		if (!sent)
+		{
+			for (int i = 0; i < MAX_OOB_CONNECTIONS; ++i)
+			{
+				if (scion_oob[i].adr.type == NA_BAD)
+					continue;
+				if (NET_CompareBaseAdr(to, &scion_oob[i].adr))
+				{
+					scion_oob[i].last = Sys_Milliseconds();
+					ret = send(scion_oob[i].socket, data, length, 0);
+					sent = qtrue;
+				}
+			}
+		}
+		if (!sent && scion_server_conn)
+		{
+			PanUDPAddr addr = NET_AddressToPan(to);
+			if (PanListenConnWriteTo(scion_server_conn, data, length, addr, &ret) == PAN_ERR_OK)
+				sent = qtrue;
+			PanDeleteHandle(addr);
+		}
+		if (!sent)
+		{
+			int i = NET_OpenOOBConn(to);
+			if (i >= 0)
+			{
+				ret = send(scion_oob[i].socket, data, length, 0);
+				sent = qtrue;
+			}
+		}
+		if (!sent)
+		{
+			Com_Printf("Sys_SendPacket: Can't send SCION packet to %s\n", NET_AdrToStringwPort(to));
+		}
 	}
-	else {
-		if(addr.ss_family == AF_INET)
-			ret = sendto( ip_socket, data, length, 0, (struct sockaddr *) &addr, sizeof(struct sockaddr_in) );
-		else if(addr.ss_family == AF_INET6)
-			ret = sendto( ip6_socket, data, length, 0, (struct sockaddr *) &addr, sizeof(struct sockaddr_in6) );
+	else
+	{
+		struct sockaddr_storage	addr;
+		memset(&addr, 0, sizeof(addr));
+		NetadrToSockadr( to, (struct sockaddr *) &addr );
+
+		if( usingSocks && to->type == NA_IP ) {
+			socksBuf[0] = 0;	// reserved
+			socksBuf[1] = 0;
+			socksBuf[2] = 0;	// fragment (not fragmented)
+			socksBuf[3] = 1;	// address type: IPV4
+			*(int *)&socksBuf[4] = ((struct sockaddr_in *)&addr)->sin_addr.s_addr;
+			*(short *)&socksBuf[8] = ((struct sockaddr_in *)&addr)->sin_port;
+			memcpy( &socksBuf[10], data, length );
+			ret = sendto( ip_socket, socksBuf, length+10, 0, &socksRelayAddr, sizeof(socksRelayAddr) );
+		}
+		else {
+			if(addr.ss_family == AF_INET)
+				ret = sendto( ip_socket, data, length, 0, (struct sockaddr *) &addr, sizeof(struct sockaddr_in) );
+			else if(addr.ss_family == AF_INET6)
+				ret = sendto( ip6_socket, data, length, 0, (struct sockaddr *) &addr, sizeof(struct sockaddr_in6) );
+		}
 	}
+
 	if( ret == SOCKET_ERROR ) {
 		int err = socketError;
 
@@ -687,7 +1335,7 @@ void Sys_SendPacket( int length, const void *data, netadr_t to ) {
 		}
 
 		// some PPP links do not allow broadcasts and return an error
-		if( ( err == EADDRNOTAVAIL ) && ( ( to.type == NA_BROADCAST ) ) ) {
+		if( ( err == EADDRNOTAVAIL ) && ( ( to->type == NA_BROADCAST ) ) ) {
 			return;
 		}
 
@@ -695,6 +1343,38 @@ void Sys_SendPacket( int length, const void *data, netadr_t to ) {
 	}
 }
 
+/*
+==================
+Sys_SendScionPacketVia
+
+Send a SCION packet via the given path.
+==================
+*/
+qboolean Sys_SendScionPacketVia(int length, const void *data, const netadr_t *to, PanPath path)
+{
+	PanError err = PAN_ERR_OK;
+
+	if (scion_client_conn && NET_CompareBaseAdr(to, &scion_client_remote))
+	{
+		err = PanConnWriteVia(scion_client_conn, data, length, path, NULL);
+	}
+	else if (scion_server_conn)
+	{
+		PanUDPAddr addr = NET_AddressToPan(to);
+		if (addr == PAN_INVALID_HANDLE) return qfalse;
+		err = PanListenConnWriteToVia(scion_server_conn, data, length, addr, path, NULL);
+		PanDeleteHandle(addr);
+	}
+
+	if (err)
+	{
+		Com_Printf("Sys_SendScionPacketVia: Can't send SCION packet to %s\n",
+			NET_AdrToStringwPort(to));
+		return qfalse;
+	}
+	else
+		return qtrue;
+};
 
 //=============================================================================
 
@@ -705,51 +1385,54 @@ Sys_IsLANAddress
 LAN clients will have their rate var ignored
 ==================
 */
-qboolean Sys_IsLANAddress( netadr_t adr ) {
-	int		index, run, addrsize;
-	qboolean differed;
-	byte *compareadr, *comparemask, *compareip;
+qboolean Sys_IsLANAddress( const netadr_t *adr ) {
+	int			index, run, addrsize;
+	qboolean	differed;
+	const byte *compareadr, *comparemask, *compareip;
 
-	if( adr.type == NA_LOOPBACK ) {
+	if( adr->type == NA_LOOPBACK ) {
 		return qtrue;
 	}
+	if (adr->type == NA_SCION_IP || adr->type == NA_SCION_IP6) {
+		return qfalse;
+	}
 
-	if( adr.type == NA_IP )
+	if( adr->type == NA_IP )
 	{
 		// RFC1918:
 		// 10.0.0.0        -   10.255.255.255  (10/8 prefix)
 		// 172.16.0.0      -   172.31.255.255  (172.16/12 prefix)
 		// 192.168.0.0     -   192.168.255.255 (192.168/16 prefix)
-		if(adr.ip[0] == 10)
+		if(adr->ip[0] == 10)
 			return qtrue;
-		if(adr.ip[0] == 172 && (adr.ip[1]&0xf0) == 16)
+		if(adr->ip[0] == 172 && (adr->ip[1]&0xf0) == 16)
 			return qtrue;
-		if(adr.ip[0] == 192 && adr.ip[1] == 168)
+		if(adr->ip[0] == 192 && adr->ip[1] == 168)
 			return qtrue;
 
-		if(adr.ip[0] == 127)
+		if(adr->ip[0] == 127)
 			return qtrue;
 	}
-	else if(adr.type == NA_IP6)
+	else if(adr->type == NA_IP6)
 	{
-		if(adr.ip6[0] == 0xfe && (adr.ip6[1] & 0xc0) == 0x80)
+		if(adr->ip6[0] == 0xfe && (adr->ip6[1] & 0xc0) == 0x80)
 			return qtrue;
-		if((adr.ip6[0] & 0xfe) == 0xfc)
+		if((adr->ip6[0] & 0xfe) == 0xfc)
 			return qtrue;
 	}
-	
+
 	// Now compare against the networks this computer is member of.
 	for(index = 0; index < numIP; index++)
 	{
-		if(localIP[index].type == adr.type)
+		if(localIP[index].type == adr->type)
 		{
-			if(adr.type == NA_IP)
+			if(adr->type == NA_IP)
 			{
 				compareip = (byte *) &((struct sockaddr_in *) &localIP[index].addr)->sin_addr.s_addr;
 				comparemask = (byte *) &((struct sockaddr_in *) &localIP[index].netmask)->sin_addr.s_addr;
-				compareadr = adr.ip;
-				
-				addrsize = sizeof(adr.ip);
+				compareadr = adr->ip;
+
+				addrsize = sizeof(adr->ip);
 			}
 			else
 			{
@@ -757,9 +1440,9 @@ qboolean Sys_IsLANAddress( netadr_t adr ) {
 
 				compareip = (byte *) &((struct sockaddr_in6 *) &localIP[index].addr)->sin6_addr;
 				comparemask = (byte *) &((struct sockaddr_in6 *) &localIP[index].netmask)->sin6_addr;
-				compareadr = adr.ip6;
-				
-				addrsize = sizeof(adr.ip6);
+				compareadr = adr->ip6;
+
+				addrsize = sizeof(adr->ip6);
 			}
 
 			differed = qfalse;
@@ -771,13 +1454,13 @@ qboolean Sys_IsLANAddress( netadr_t adr ) {
 					break;
 				}
 			}
-			
+
 			if(!differed)
 				return qtrue;
 
 		}
 	}
-	
+
 	return qfalse;
 }
 
@@ -949,7 +1632,7 @@ SOCKET NET_IP6Socket( char *net_interface, int port, struct sockaddr_in6 *bindto
 		closesocket( newsocket );
 		return INVALID_SOCKET;
 	}
-	
+
 	if(bindto)
 		*bindto = address;
 
@@ -970,12 +1653,12 @@ void NET_SetMulticast6(void)
 	{
 		Com_Printf("WARNING: NET_JoinMulticast6: Incorrect multicast address given, "
 			   "please set cvar %s to a sane value.\n", net_mcast6addr->name);
-		
+
 		Cvar_SetValue(net_enabled->name, net_enabled->integer | NET_DISABLEMCAST);
-		
+
 		return;
 	}
-	
+
 	memcpy(&curgroup.ipv6mr_multiaddr, &addr.sin6_addr, sizeof(curgroup.ipv6mr_multiaddr));
 
 	if(*net_mcast6iface->string)
@@ -999,10 +1682,10 @@ Join an ipv6 multicast group
 void NET_JoinMulticast6(void)
 {
 	int err;
-	
+
 	if(ip6_socket == INVALID_SOCKET || multicast6_socket != INVALID_SOCKET || (net_enabled->integer & NET_DISABLEMCAST))
 		return;
-	
+
 	if(IN6_IS_ADDR_MULTICAST(&boundto.sin6_addr) || IN6_IS_ADDR_UNSPECIFIED(&boundto.sin6_addr))
 	{
 		// The way the socket was bound does not prohibit receiving multi-cast packets. So we don't need to open a new one.
@@ -1016,7 +1699,7 @@ void NET_JoinMulticast6(void)
 			multicast6_socket = ip6_socket;
 		}
 	}
-	
+
 	if(curgroup.ipv6mr_interface)
 	{
 		if (setsockopt(multicast6_socket, IPPROTO_IPV6, IPV6_MULTICAST_IF,
@@ -1235,11 +1918,11 @@ static void NET_AddLocalAddress(char *ifname, struct sockaddr *addr, struct sock
 {
 	int addrlen;
 	sa_family_t family;
-	
+
 	// only add addresses that have all required info.
 	if(!addr || !netmask || !ifname)
 		return;
-	
+
 	family = addr->sa_family;
 
 	if(numIP < MAX_IPS)
@@ -1256,14 +1939,14 @@ static void NET_AddLocalAddress(char *ifname, struct sockaddr *addr, struct sock
 		}
 		else
 			return;
-		
+
 		Q_strncpyz(localIP[numIP].ifname, ifname, sizeof(localIP[numIP].ifname));
-	
+
 		localIP[numIP].family = family;
 
 		memcpy(&localIP[numIP].addr, addr, addrlen);
 		memcpy(&localIP[numIP].netmask, netmask, addrlen);
-		
+
 		numIP++;
 	}
 }
@@ -1285,9 +1968,9 @@ static void NET_GetLocalAddress(void)
 			if(ifap->ifa_flags & IFF_UP)
 				NET_AddLocalAddress(search->ifa_name, search->ifa_addr, search->ifa_netmask);
 		}
-	
+
 		freeifaddrs(ifap);
-		
+
 		Sys_ShowIP();
 	}
 }
@@ -1303,21 +1986,21 @@ static void NET_GetLocalAddress( void ) {
 		return;
 
 	Com_Printf( "Hostname: %s\n", hostname );
-	
+
 	memset(&hint, 0, sizeof(hint));
-	
+
 	hint.ai_family = AF_UNSPEC;
 	hint.ai_socktype = SOCK_DGRAM;
-	
+
 	if(!getaddrinfo(hostname, NULL, &hint, &res))
 	{
 		struct sockaddr_in mask4;
 		struct sockaddr_in6 mask6;
 		struct addrinfo *search;
-	
+
 		/* On operating systems where it's more difficult to find out the configured interfaces, we'll just assume a
 		 * netmask with all bits set. */
-	
+
 		memset(&mask4, 0, sizeof(mask4));
 		memset(&mask6, 0, sizeof(mask6));
 		mask4.sin_family = AF_INET;
@@ -1333,10 +2016,10 @@ static void NET_GetLocalAddress( void ) {
 			else if(search->ai_family == AF_INET6)
 				NET_AddLocalAddress("", search->ai_addr, (struct sockaddr *) &mask6);
 		}
-	
+
 		Sys_ShowIP();
 	}
-	
+
 	if(res)
 		freeaddrinfo(res);
 }
@@ -1400,7 +2083,7 @@ void NET_OpenIP( void ) {
 					break;
 			}
 		}
-		
+
 		if(ip_socket == INVALID_SOCKET)
 			Com_Printf( "WARNING: Couldn't bind to a v4 ip address.\n");
 	}
@@ -1432,18 +2115,26 @@ static qboolean NET_GetCvars( void ) {
 	net_ip = Cvar_Get( "net_ip", "0.0.0.0", CVAR_LATCH );
 	modified += net_ip->modified;
 	net_ip->modified = qfalse;
-	
+
 	net_ip6 = Cvar_Get( "net_ip6", "::", CVAR_LATCH );
 	modified += net_ip6->modified;
 	net_ip6->modified = qfalse;
-	
+
+	net_scion = Cvar_Get( "net_scion", "127.0.0.1", CVAR_LATCH );
+	modified += net_scion->modified;
+	net_scion->modified = qfalse;
+
 	net_port = Cvar_Get( "net_port", va( "%i", PORT_SERVER ), CVAR_LATCH );
 	modified += net_port->modified;
 	net_port->modified = qfalse;
-	
+
 	net_port6 = Cvar_Get( "net_port6", va( "%i", PORT_SERVER ), CVAR_LATCH );
 	modified += net_port6->modified;
 	net_port6->modified = qfalse;
+
+	net_scion_port = Cvar_Get( "net_scion_port", va( "%i", PORT_SERVER ), CVAR_LATCH );
+	modified += net_scion_port->modified;
+	net_scion_port->modified = qfalse;
 
 	// Some cvars for configuring multicast options which facilitates scanning for servers on local subnets.
 	net_mcast6addr = Cvar_Get( "net_mcast6addr", NET_MULTICAST_IP6, CVAR_LATCH | CVAR_ARCHIVE );
@@ -1479,6 +2170,7 @@ static qboolean NET_GetCvars( void ) {
 	net_socksPassword->modified = qfalse;
 
 	net_dropsim = Cvar_Get("net_dropsim", "", CVAR_TEMP);
+	net_oobTimeout = Cvar_Get("net_oobTimeout", "1000", CVAR_ARCHIVE);
 
 	return modified ? qtrue : qfalse;
 }
@@ -1493,6 +2185,7 @@ void NET_Config( qboolean enableNetworking ) {
 	qboolean	modified;
 	qboolean	stop;
 	qboolean	start;
+	netadr_t    scionServerAddress = {0};
 
 	// get any latched changes to cvars
 	modified = NET_GetCvars();
@@ -1538,7 +2231,7 @@ void NET_Config( qboolean enableNetworking ) {
 		{
 			if(multicast6_socket != ip6_socket)
 				closesocket(multicast6_socket);
-				
+
 			multicast6_socket = INVALID_SOCKET;
 		}
 
@@ -1551,7 +2244,12 @@ void NET_Config( qboolean enableNetworking ) {
 			closesocket( socks_socket );
 			socks_socket = INVALID_SOCKET;
 		}
-		
+
+		if (net_enabled->integer & NET_ENABLE_SCION)
+			scionServerAddress = scion_client_remote;
+
+		NET_ScionServerStop();
+		NET_ScionClientClose();
 	}
 
 	if( start )
@@ -1560,10 +2258,13 @@ void NET_Config( qboolean enableNetworking ) {
 		{
 			NET_OpenIP();
 			NET_SetMulticast6();
+			if (Cvar_VariableValue("sv_running"))
+				NET_ScionServerStart();
+			if (scionServerAddress.type != NA_BAD)
+				NET_ScionClientConnect(&scionServerAddress);
 		}
 	}
 }
-
 
 /*
 ====================
@@ -1585,7 +2286,7 @@ void NET_Init( void ) {
 #endif
 
 	NET_Config( qtrue );
-	
+
 	Cmd_AddCommand ("net_restart", NET_Restart_f);
 }
 
@@ -1621,7 +2322,7 @@ void NET_Event(fd_set *fdr)
 	byte bufData[MAX_MSGLEN + 1];
 	netadr_t from = {0};
 	msg_t netmsg;
-	
+
 	while(1)
 	{
 		MSG_Init(&netmsg, bufData, sizeof(bufData));
@@ -1638,7 +2339,7 @@ void NET_Event(fd_set *fdr)
 			if(com_sv_running->integer)
 				Com_RunAndTimeServerPacket(&from, &netmsg);
 			else
-				CL_PacketEvent(from, &netmsg);
+				CL_PacketEvent(&from, &netmsg);
 		}
 		else
 			break;
@@ -1676,6 +2377,34 @@ void NET_Sleep(int msec)
 
 		if(highestfd == INVALID_SOCKET || ip6_socket > highestfd)
 			highestfd = ip6_socket;
+	}
+	if(scion_server_socket != INVALID_SOCKET)
+	{
+		FD_SET(scion_server_socket, &fdr);
+
+		if(highestfd == INVALID_SOCKET || scion_server_socket > highestfd)
+			highestfd = scion_server_socket;
+	}
+	if(scion_client_socket != INVALID_SOCKET)
+	{
+		FD_SET(scion_client_socket, &fdr);
+
+		if(highestfd == INVALID_SOCKET || scion_client_socket > highestfd)
+			highestfd = scion_client_socket;
+	}
+	for (int i = 0; i < MAX_OOB_CONNECTIONS; ++i)
+	{
+		if (scion_oob[i].adr.type == NA_BAD)
+			continue;
+
+		if (Sys_Milliseconds() - scion_oob[i].last > net_oobTimeout->integer)
+			NET_ClearOOBSlot(i);
+		else
+		{
+			FD_SET(scion_oob[i].socket, &fdr);
+			if(highestfd == INVALID_SOCKET || scion_oob[i].socket > highestfd)
+				highestfd = scion_oob[i].socket;
+		}
 	}
 
 #ifdef _WIN32

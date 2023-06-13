@@ -62,6 +62,9 @@ cvar_t	*sv_lanForceRate; // dedicated 1 (LAN) server forces local client rates t
 cvar_t	*sv_strictAuth;
 #endif
 cvar_t	*sv_banFile;
+#ifdef USE_LIBSODIUM
+cvar_t	*sv_encryption;
+#endif
 
 serverBan_t serverBans[SERVER_MAXBANS];
 int serverBansCount = 0;
@@ -176,7 +179,7 @@ void SV_AddServerCommand( client_t *client, const char *cmd ) {
 =================
 SV_SendServerCommand
 
-Sends a reliable command string to be interpreted by 
+Sends a reliable command string to be interpreted by
 the client game module: "cp", "print", "chat", etc
 A NULL client will broadcast to all clients
 =================
@@ -186,7 +189,7 @@ void QDECL SV_SendServerCommand(client_t *cl, const char *fmt, ...) {
 	byte		message[MAX_MSGLEN];
 	client_t	*client;
 	int			j;
-	
+
 	va_start (argptr,fmt);
 	Q_vsnprintf ((char *)message, sizeof(message), fmt,argptr);
 	va_end (argptr);
@@ -226,6 +229,49 @@ MASTER SERVER FUNCTIONS
 
 /*
 ================
+SV_GetPathToMaster
+
+Workaround for PAN. The listening connection of the server cannot be used to
+initiate the connection to the master server. We need to get a path to the
+master server first by creating a temporary connected PAN socket and sending
+a heartbeat to which we will get a reply (if the master server is reachable).
+The temporary connection will use a random port as PAN cannot bind two sockets
+to the same IP and port. However, we can use the path obtained with the dummy
+heartbeat to send out real heartbeat from the correct port.
+================
+*/
+PanPath SV_GetPathToMaster(int length, const void *message, const netadr_t *to)
+{
+	PanPath ret = PAN_INVALID_HANDLE;
+	char local[NET_ADDRSTRMAXLEN];
+
+	PanUDPAddr addr = NET_AddressToPan(to);
+	if (addr == PAN_INVALID_HANDLE) return ret;
+
+	PanConn conn = PAN_INVALID_HANDLE;
+	NET_GetLocalForPan(local, sizeof(local), 1);
+	PanError err = PanDialUDP(local, addr, PAN_INVALID_HANDLE, PAN_INVALID_HANDLE, &conn);
+	if (err) goto addr_cleanup;
+
+	err = PanConnWrite(conn, message, length, NULL);
+	if (err) goto conn_cleanup;
+
+	char response[MAX_PACKETLEN];
+	PanConnSetReadDeadline(conn, 1000);
+	err = PanConnReadVia(conn, response, MAX_PACKETLEN, &ret, NULL);
+	if (err == PAN_ERR_DEADLINE)
+		Com_Printf("SV_GetPathToMaster: Master server not responding\n");
+
+conn_cleanup:
+	PanConnClose(conn);
+	PanDeleteHandle(conn);
+addr_cleanup:
+	PanDeleteHandle(addr);
+	return ret;
+}
+
+/*
+================
 SV_MasterHeartbeat
 
 Send a message to the masters every few minutes to
@@ -239,7 +285,8 @@ but not on every player enter or exit.
 #define	MASTERDNS_MSEC	24*60*60*1000
 void SV_MasterHeartbeat(const char *message)
 {
-	static netadr_t	adr[MAX_MASTER_SERVERS][2]; // [2] for v4 and v6 address for the same address string.
+	static netadr_t	adr[MAX_MASTER_SERVERS][3];     // [3] for IPv4, IPv6, and SCION address for the same address string.
+	static PanPath  path[MAX_MASTER_SERVERS] = {0}; // SCION paths to master servers
 	int			i;
 	int			res;
 	int			netenabled;
@@ -247,7 +294,8 @@ void SV_MasterHeartbeat(const char *message)
 	netenabled = Cvar_VariableIntegerValue("net_enabled");
 
 	// "dedicated 1" is for lan play, "dedicated 2" is for inet public play
-	if (!com_dedicated || com_dedicated->integer != 2 || !(netenabled & (NET_ENABLEV4 | NET_ENABLEV6)))
+	if (!com_dedicated || com_dedicated->integer != 2 ||
+		!(netenabled & (NET_ENABLEV4 | NET_ENABLEV6 | NET_ENABLE_SCION)))
 		return;		// only dedicated servers send heartbeats
 
 	// if not time yet, don't send anything
@@ -271,7 +319,7 @@ void SV_MasterHeartbeat(const char *message)
 		{
 			sv_master[i]->modified = qfalse;
 			svs.masterResolveTime[i] = svs.time + MASTERDNS_MSEC;
-			
+
 			if(netenabled & NET_ENABLEV4)
 			{
 				Com_Printf("Resolving %s (IPv4)\n", sv_master[i]->string);
@@ -282,13 +330,13 @@ void SV_MasterHeartbeat(const char *message)
 					// if no port was specified, use the default master port
 					adr[i][0].port = BigShort(PORT_MASTER);
 				}
-				
+
 				if(res)
-					Com_Printf( "%s resolved to %s\n", sv_master[i]->string, NET_AdrToStringwPort(adr[i][0]));
+					Com_Printf( "%s resolved to %s\n", sv_master[i]->string, NET_AdrToStringwPort(&adr[i][0]));
 				else
 					Com_Printf( "%s has no IPv4 address.\n", sv_master[i]->string);
 			}
-			
+
 			if(netenabled & NET_ENABLEV6)
 			{
 				Com_Printf("Resolving %s (IPv6)\n", sv_master[i]->string);
@@ -299,15 +347,32 @@ void SV_MasterHeartbeat(const char *message)
 					// if no port was specified, use the default master port
 					adr[i][1].port = BigShort(PORT_MASTER);
 				}
-				
+
 				if(res)
-					Com_Printf( "%s resolved to %s\n", sv_master[i]->string, NET_AdrToStringwPort(adr[i][1]));
+					Com_Printf( "%s resolved to %s\n", sv_master[i]->string, NET_AdrToStringwPort(&adr[i][1]));
 				else
 					Com_Printf( "%s has no IPv6 address.\n", sv_master[i]->string);
 			}
+
+			if(netenabled & NET_ENABLE_SCION)
+			{
+				Com_Printf("Resolving %s (SCION)\n", sv_master[i]->string);
+				res = NET_StringToAdr(sv_master[i]->string, &adr[i][2], NA_SCION_IP);
+
+				if(res == 2)
+				{
+					// if no port was specified, use the default master port
+					adr[i][2].port = BigShort(PORT_MASTER);
+				}
+
+				if(res)
+					Com_Printf( "%s resolved to %s\n", sv_master[i]->string, NET_AdrToStringwPort(&adr[i][2]));
+				else
+					Com_Printf( "%s has no SCION address.\n", sv_master[i]->string);
+			}
 		}
 
-		if(adr[i][0].type == NA_BAD && adr[i][1].type == NA_BAD)
+		if(adr[i][0].type == NA_BAD && adr[i][1].type == NA_BAD && adr[i][2].type == NA_BAD)
 		{
 			continue;
 		}
@@ -319,9 +384,24 @@ void SV_MasterHeartbeat(const char *message)
 		// ever incompatably changes
 
 		if(adr[i][0].type != NA_BAD)
-			NET_OutOfBandPrint( NS_SERVER, adr[i][0], "heartbeat %s\n", message);
+			NET_OutOfBandPrint( NS_SERVER, &adr[i][0], "heartbeat %s\n", message);
 		if(adr[i][1].type != NA_BAD)
-			NET_OutOfBandPrint( NS_SERVER, adr[i][1], "heartbeat %s\n", message);
+			NET_OutOfBandPrint( NS_SERVER, &adr[i][1], "heartbeat %s\n", message);
+		if(adr[i][2].type != NA_BAD)
+		{
+			char string[64];
+			Com_sprintf(string, sizeof(string), "\xff\xff\xff\xffheartbeat %s\n", message);
+			int length = strlen(string);
+
+			if (!path[i]) path[i] = SV_GetPathToMaster(length, string, &adr[i][2]);
+			if (!path[i]) continue;
+
+			if (!Sys_SendScionPacketVia(strlen(string), string, &adr[i][2], path[i]))
+			{
+				PanDeleteHandle(path[i]);
+				path[i] = PAN_INVALID_HANDLE;
+			}
+		}
 	}
 }
 
@@ -367,20 +447,32 @@ leakyBucket_t outboundLeakyBucket;
 SVC_HashForAddress
 ================
 */
-static long SVC_HashForAddress( netadr_t address ) {
-	byte 		*ip = NULL;
-	size_t	size = 0;
+static long SVC_HashForAddress( const netadr_t *address ) {
+	const byte *ip = NULL;
+	size_t		size = 0;
 	int			i;
 	long		hash = 0;
 
-	switch ( address.type ) {
-		case NA_IP:  ip = address.ip;  size = 4; break;
-		case NA_IP6: ip = address.ip6; size = 16; break;
+	switch ( address->type ) {
+		case NA_IP:
+		case NA_SCION_IP:
+			ip = address->ip;  size = 4; break;
+		case NA_IP6:
+		case NA_SCION_IP6:
+			ip = address->ip6; size = 16; break;
 		default: break;
 	}
 
 	for ( i = 0; i < size; i++ ) {
 		hash += (long)( ip[ i ] ) * ( i + 119 );
+	}
+
+	if ( address->type == NA_SCION_IP || address->type == NA_SCION_IP6) {
+		for (i = 0; i < 2; i++)
+			hash += (long)(address->isd[i]) * (i + size + 119);
+		size += 2;
+		for (i = 0; i < 6; i++)
+			hash += (long)(address->asn[i]) * (i + size + 119);
 	}
 
 	hash = ( hash ^ ( hash >> 10 ) ^ ( hash >> 20 ) );
@@ -396,7 +488,7 @@ SVC_BucketForAddress
 Find or allocate a bucket for an address
 ================
 */
-static leakyBucket_t *SVC_BucketForAddress( netadr_t address, int burst, int period ) {
+static leakyBucket_t *SVC_BucketForAddress( const netadr_t *address, int burst, int period ) {
 	leakyBucket_t	*bucket = NULL;
 	int						i;
 	long					hash = SVC_HashForAddress( address );
@@ -405,13 +497,25 @@ static leakyBucket_t *SVC_BucketForAddress( netadr_t address, int burst, int per
 	for ( bucket = bucketHashes[ hash ]; bucket; bucket = bucket->next ) {
 		switch ( bucket->type ) {
 			case NA_IP:
-				if ( memcmp( bucket->ipv._4, address.ip, 4 ) == 0 ) {
+			case NA_SCION_IP:
+				if ( memcmp( bucket->ipv._4, address->ip, 4 ) == 0 ) {
+					return bucket;
+				}
+				if ( bucket->type == NA_SCION_IP
+					&& memcmp( bucket->isd, address->isd, 2 ) == 0
+					&& memcmp( bucket->asn, address->asn, 6 ) == 0  ) {
 					return bucket;
 				}
 				break;
 
 			case NA_IP6:
-				if ( memcmp( bucket->ipv._6, address.ip6, 16 ) == 0 ) {
+			case NA_SCION_IP6:
+				if ( memcmp( bucket->ipv._6, address->ip6, 16 ) == 0 ) {
+					return bucket;
+				}
+				if ( bucket->type == NA_SCION_IP6
+					&& memcmp( bucket->isd, address->isd, 2 ) == 0
+					&& memcmp( bucket->asn, address->asn, 6 ) == 0  ) {
 					return bucket;
 				}
 				break;
@@ -435,7 +539,7 @@ static leakyBucket_t *SVC_BucketForAddress( netadr_t address, int burst, int per
 			} else {
 				bucketHashes[ bucket->hash ] = bucket->next;
 			}
-			
+
 			if ( bucket->next != NULL ) {
 				bucket->next->prev = bucket->prev;
 			}
@@ -444,11 +548,21 @@ static leakyBucket_t *SVC_BucketForAddress( netadr_t address, int burst, int per
 		}
 
 		if ( bucket->type == NA_BAD ) {
-			bucket->type = address.type;
-			switch ( address.type ) {
-				case NA_IP:  Com_Memcpy( bucket->ipv._4, address.ip, 4 );   break;
-				case NA_IP6: Com_Memcpy( bucket->ipv._6, address.ip6, 16 ); break;
+			bucket->type = address->type;
+			switch ( address->type ) {
+				case NA_IP:
+				case NA_SCION_IP:
+					Com_Memcpy( bucket->ipv._4, address->ip, 4 );
+					break;
+				case NA_IP6:
+				case NA_SCION_IP6:
+					Com_Memcpy( bucket->ipv._6, address->ip6, 16 );
+					break;
 				default: break;
+			}
+			if ( address->type == NA_SCION_IP || address->type == NA_SCION_IP ) {
+				Com_Memcpy( bucket->isd, address->isd, 2 );
+				Com_Memcpy( bucket->asn, address->asn, 6 );
 			}
 
 			bucket->lastTime = now;
@@ -509,7 +623,7 @@ SVC_RateLimitAddress
 Rate limit for a particular address
 ================
 */
-qboolean SVC_RateLimitAddress( netadr_t from, int burst, int period ) {
+qboolean SVC_RateLimitAddress( const netadr_t *from, int burst, int period ) {
 	leakyBucket_t *bucket = SVC_BucketForAddress( from, burst, period );
 
 	return SVC_RateLimit( bucket, burst, period );
@@ -524,7 +638,7 @@ and all connected players.  Used for getting detailed information after
 the simple info query.
 ================
 */
-static void SVC_Status( netadr_t from ) {
+static void SVC_Status( const netadr_t *from ) {
 	char	player[1024];
 	char	status[MAX_MSGLEN];
 	int		i;
@@ -570,7 +684,7 @@ static void SVC_Status( netadr_t from ) {
 		cl = &svs.clients[i];
 		if ( cl->state >= CS_CONNECTED ) {
 			ps = SV_GameClientNum( i );
-			Com_sprintf (player, sizeof(player), "%i %i \"%s\"\n", 
+			Com_sprintf (player, sizeof(player), "%i %i \"%s\"\n",
 				ps->persistant[PERS_SCORE], cl->ping, cl->name);
 			playerLength = strlen(player);
 			if (statusLength + playerLength >= sizeof(status) ) {
@@ -592,7 +706,7 @@ Responds with a short info message that should be enough to determine
 if a user is interested in a server to do a full status
 ================
 */
-void SVC_Info( netadr_t from ) {
+void SVC_Info( const netadr_t *from ) {
 	int		i, count, humans;
 	char	*gamedir;
 	char	infostring[MAX_INFO_STRING];
@@ -655,7 +769,7 @@ void SVC_Info( netadr_t from ) {
 	Info_SetValueForKey( infostring, "mapname", sv_mapname->string );
 	Info_SetValueForKey( infostring, "clients", va("%i", count) );
 	Info_SetValueForKey(infostring, "g_humanplayers", va("%i", humans));
-	Info_SetValueForKey( infostring, "sv_maxclients", 
+	Info_SetValueForKey( infostring, "sv_maxclients",
 		va("%i", sv_maxclients->integer - sv_privateClients->integer ) );
 	Info_SetValueForKey( infostring, "gametype", va("%i", sv_gametype->integer ) );
 	Info_SetValueForKey( infostring, "pure", va("%i", sv_pure->integer ) );
@@ -688,7 +802,7 @@ SVC_FlushRedirect
 ================
 */
 static void SV_FlushRedirect( char *outputbuf ) {
-	NET_OutOfBandPrint( NS_SERVER, svs.redirectAddress, "print\n%s", outputbuf );
+	NET_OutOfBandPrint( NS_SERVER, &svs.redirectAddress, "print\n%s", outputbuf );
 }
 
 /*
@@ -700,7 +814,7 @@ Shift down the remaining args
 Redirect all printfs
 ===============
 */
-static void SVC_RemoteCommand( netadr_t from, msg_t *msg ) {
+static void SVC_RemoteCommand( const netadr_t *from, msg_t *msg ) {
 	qboolean	valid;
 	char		remaining[1024];
 	// TTimo - scaled down to accumulate, but not overflow anything network wise, print wise etc.
@@ -734,7 +848,7 @@ static void SVC_RemoteCommand( netadr_t from, msg_t *msg ) {
 	}
 
 	// start redirecting all print outputs to the packet
-	svs.redirectAddress = from;
+	svs.redirectAddress = *from;
 	Com_BeginRedirect (sv_outputbuf, SV_OUTPUTBUF_LENGTH, SV_FlushRedirect);
 
 	if ( !strlen( sv_rconPassword->string ) ) {
@@ -743,7 +857,7 @@ static void SVC_RemoteCommand( netadr_t from, msg_t *msg ) {
 		Com_Printf ("Bad rconpassword.\n");
 	} else {
 		remaining[0] = 0;
-		
+
 		// https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=543
 		// get the command directly, "rcon <pass> <command>" to avoid quoting issues
 		// extract the command by walking
@@ -756,9 +870,9 @@ static void SVC_RemoteCommand( netadr_t from, msg_t *msg ) {
 			cmd_aux++;
 		while(cmd_aux[0]==' ')
 			cmd_aux++;
-		
+
 		Q_strcat( remaining, sizeof(remaining), cmd_aux);
-		
+
 		Cmd_ExecuteString (remaining);
 
 	}
@@ -776,7 +890,7 @@ Clients that are in the game can still send
 connectionless packets.
 =================
 */
-static void SV_ConnectionlessPacket( netadr_t from, msg_t *msg ) {
+static void SV_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 	char	*s;
 	char	*c;
 
@@ -824,7 +938,7 @@ static void SV_ConnectionlessPacket( netadr_t from, msg_t *msg ) {
 SV_PacketEvent
 =================
 */
-void SV_PacketEvent( netadr_t from, msg_t *msg ) {
+void SV_PacketEvent( const netadr_t *from, msg_t *msg ) {
 	int			i;
 	client_t	*cl;
 	int			qport;
@@ -846,21 +960,13 @@ void SV_PacketEvent( netadr_t from, msg_t *msg ) {
 		if (cl->state == CS_FREE) {
 			continue;
 		}
-		if ( !NET_CompareBaseAdr( from, cl->netchan.remoteAddress ) ) {
+		if ( !NET_CompareBaseAdr( from, &cl->netchan.remoteAddress ) ) {
 			continue;
 		}
 		// it is possible to have multiple clients from a single IP
 		// address, so they are differentiated by the qport variable
 		if (cl->netchan.qport != qport) {
 			continue;
-		}
-
-		// the IP port can't be used to differentiate them, because
-		// some address translating routers periodically change UDP
-		// port assignments
-		if (cl->netchan.remoteAddress.port != from.port) {
-			Com_Printf( "SV_PacketEvent: fixing up a translated port\n" );
-			cl->netchan.remoteAddress.port = from.port;
 		}
 
 		// make sure it is a valid, in sequence packet
@@ -872,6 +978,14 @@ void SV_PacketEvent( netadr_t from, msg_t *msg ) {
 				cl->lastPacketTime = svs.time;	// don't timeout
 				SV_ExecuteClientMessage( cl, msg );
 			}
+		}
+
+		// the IP port can't be used to differentiate them, because
+		// some address translating routers periodically change UDP
+		// port assignments
+		if (cl->netchan.remoteAddress.port != from->port) {
+			Com_Printf( "SV_PacketEvent: fixing up a translated port\n" );
+			cl->netchan.remoteAddress.port = from->port;
 		}
 		return;
 	}
@@ -936,7 +1050,7 @@ static void SV_CalcPings( void ) {
 ==================
 SV_CheckTimeouts
 
-If a packet has not been received from a client for timeout->integer 
+If a packet has not been received from a client for timeout->integer
 seconds, drop the conneciton.  Server time is used instead of
 realtime to avoid dropping the local client while debugging.
 
@@ -971,7 +1085,7 @@ static void SV_CheckTimeouts( void ) {
 			// wait several frames so a debugger session doesn't
 			// cause a timeout
 			if ( ++cl->timeoutCount > 5 ) {
-				SV_DropClient (cl, "timed out"); 
+				SV_DropClient (cl, "timed out");
 				cl->state = CS_FREE;	// don't bother with zombie state
 			}
 		} else {
@@ -1026,9 +1140,9 @@ int SV_FrameMsec()
 	if(sv_fps)
 	{
 		int frameMsec;
-		
+
 		frameMsec = 1000.0f / sv_fps->value;
-		
+
 		if(frameMsec < sv.timeResidual)
 			return 0;
 		else
@@ -1173,7 +1287,7 @@ int SV_RateMsec(client_t *client)
 {
 	int rate, rateMsec;
 	int messageSize;
-	
+
 	messageSize = client->netchan.lastSentSize;
 	rate = client->rate;
 
@@ -1197,10 +1311,10 @@ int SV_RateMsec(client_t *client)
 		messageSize += UDPIP6_HEADER_SIZE;
 	else
 		messageSize += UDPIP_HEADER_SIZE;
-		
+
 	rateMsec = messageSize * 1000 / ((int) (rate * com_timescale->value));
 	rate = Sys_Milliseconds() - client->netchan.lastSentTime;
-	
+
 	if(rate > rateMsec)
 		return 0;
 	else

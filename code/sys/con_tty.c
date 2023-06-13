@@ -341,6 +341,8 @@ char *CON_Input( void )
 
 	if(ttycon_on)
 	{
+		// TODO(lschulz): Go causes stdin to reset to blocking. Find a better, more reliable workaround.
+		fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) | O_NONBLOCK );
 		avail = read(STDIN_FILENO, &key, 1);
 		if (avail != -1)
 		{

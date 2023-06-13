@@ -203,6 +203,10 @@ ifndef USE_FREETYPE
 USE_FREETYPE=0
 endif
 
+ifndef USE_LIBSODIUM
+USE_LIBSODIUM=1
+endif
+
 ifndef USE_INTERNAL_LIBS
 USE_INTERNAL_LIBS=1
 endif
@@ -401,7 +405,8 @@ ifneq (,$(findstring "$(PLATFORM)", "linux" "gnu_kfreebsd" "kfreebsd-gnu" "gnu")
   LIBS=-ldl -lm
   AUTOUPDATER_LIBS += -ldl
 
-  CLIENT_LIBS=$(SDL_LIBS)
+  CLIENT_LIBS=$(SDL_LIBS) -lpan
+  DEDICATED_LIBS=-lpan
   RENDERER_LIBS = $(SDL_LIBS)
 
   ifeq ($(USE_OPENAL),1)
@@ -419,6 +424,11 @@ ifneq (,$(findstring "$(PLATFORM)", "linux" "gnu_kfreebsd" "kfreebsd-gnu" "gnu")
 
   ifeq ($(USE_MUMBLE),1)
     CLIENT_LIBS += -lrt
+  endif
+
+  ifeq ($(USE_LIBSODIUM),1)
+    CLIENT_LIBS += -lsodium
+    DEDICATED_LIBS += -lsodium
   endif
 
   ifeq ($(ARCH),x86)
@@ -1211,6 +1221,11 @@ ifeq ($(USE_MUMBLE),1)
   CLIENT_CFLAGS += -DUSE_MUMBLE
 endif
 
+ifeq ($(USE_LIBSODIUM),1)
+  CLIENT_CFLAGS += -DUSE_LIBSODIUM
+  SERVER_CFLAGS += -DUSE_LIBSODIUM
+endif
+
 ifeq ($(USE_INTERNAL_ZLIB),1)
   ZLIB_CFLAGS = -DNO_GZIP -I$(ZDIR)
 else
@@ -1791,6 +1806,7 @@ Q3OBJ = \
   $(B)/client/msg.o \
   $(B)/client/net_chan.o \
   $(B)/client/net_ip.o \
+  $(B)/client/net_path_sel.o \
   $(B)/client/huffman.o \
   \
   $(B)/client/snd_altivec.o \
@@ -1865,6 +1881,10 @@ Q3OBJ = \
   $(B)/client/con_log.o \
   $(B)/client/sys_autoupdater.o \
   $(B)/client/sys_main.o
+
+ifeq ($(USE_LIBSODIUM),1)
+  Q3OBJ += $(B)/client/cl_known_servers.o
+endif
 
 ifdef MINGW
   Q3OBJ += \
@@ -2359,6 +2379,7 @@ Q3DOBJ = \
   $(B)/ded/msg.o \
   $(B)/ded/net_chan.o \
   $(B)/ded/net_ip.o \
+  $(B)/client/net_path_sel.o \
   $(B)/ded/huffman.o \
   \
   $(B)/ded/q_math.o \
@@ -2462,7 +2483,7 @@ endif
 
 $(B)/$(SERVERBIN)$(FULLBINEXT): $(Q3DOBJ)
 	$(echo_cmd) "LD $@"
-	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) $(NOTSHLIBLDFLAGS) -o $@ $(Q3DOBJ) $(LIBS)
+	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) $(NOTSHLIBLDFLAGS) -o $@ $(Q3DOBJ) $(DEDICATED_LIBS) $(LIBS)
 
 
 

@@ -34,7 +34,7 @@ idnewt:28000
 =============
 */
 qboolean	NET_StringToAdr (char *s, netadr_t *a)
-{	
+{
 	if (!strcmp (s, "localhost")) {
 		memset (a, 0, sizeof(*a));
 		a->type = NA_LOOPBACK;
@@ -49,5 +49,5 @@ qboolean	NET_StringToAdr (char *s, netadr_t *a)
 Sys_SendPacket
 ==================
 */
-void Sys_SendPacket( int length, void *data, netadr_t to ) {
+void Sys_SendPacket( int length, void *data, const netadr_t *to ) {
 }

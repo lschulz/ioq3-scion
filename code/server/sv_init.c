@@ -22,6 +22,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "server.h"
 
+#ifdef USE_LIBSODIUM
+#define SV_SECRET_KEY_FILE "secret_key"
+#endif
 
 /*
 ===============
@@ -139,7 +142,7 @@ void SV_SetConfigstring (int index, const char *val) {
 			if ( index == CS_SERVERINFO && client->gentity && (client->gentity->r.svFlags & SVF_NOSERVERINFO) ) {
 				continue;
 			}
-		
+
 			SV_SendConfigstring(client, index);
 		}
 	}
@@ -216,7 +219,7 @@ baseline will be transmitted
 */
 static void SV_CreateBaseline( void ) {
 	sharedEntity_t *svent;
-	int				entnum;	
+	int				entnum;
 
 	for ( entnum = 1; entnum < sv.num_entities ; entnum++ ) {
 		svent = SV_GentityNum(entnum);
@@ -284,9 +287,10 @@ static void SV_Startup( void ) {
 	}
 
 	Cvar_Set( "sv_running", "1" );
-	
+
 	// Join the ipv6 multicast group now that a map is running so clients can scan for us on the local network.
 	NET_JoinMulticast6();
+	NET_ScionServerStart();
 }
 
 
@@ -346,7 +350,7 @@ void SV_ChangeMaxClients( void ) {
 
 	// free the old clients on the hunk
 	Hunk_FreeTempMemory( oldClients );
-	
+
 	// allocate new snapshot entities
 	if ( com_dedicated->integer ) {
 		svs.numSnapshotEntities = sv_maxclients->integer * PACKET_BACKUP * MAX_SNAPSHOT_ENTITIES;
@@ -421,7 +425,7 @@ void SV_SpawnServer( char *server, qboolean killBots ) {
 	// clear collision map data
 	CM_ClearMap();
 
-	// init client structures and svs.numSnapshotEntities 
+	// init client structures and svs.numSnapshotEntities
 	if ( !Cvar_VariableValue("sv_running") ) {
 		SV_Startup();
 	} else {
@@ -482,7 +486,7 @@ void SV_SpawnServer( char *server, qboolean killBots ) {
 
 	// clear physics interaction links
 	SV_ClearWorld ();
-	
+
 	// media configstring setting should be done during
 	// the loading stage, so connected clients don't have
 	// to load during actual gameplay
@@ -551,7 +555,7 @@ void SV_SpawnServer( char *server, qboolean killBots ) {
 				}
 			}
 		}
-	}	
+	}
 
 	// run another frame to allow things to look at all the players
 	VM_Call (gvm, GAME_RUN_FRAME, sv.time);
@@ -616,6 +620,44 @@ void SV_SpawnServer( char *server, qboolean killBots ) {
 	Com_Printf ("-----------------------------------\n");
 }
 
+#ifdef USE_LIBSODIUM
+/*
+==================
+SV_LoadKeys
+
+Load or generate server keys.
+==================
+*/
+static void SV_LoadKeys(void)
+{
+	int len = 0;
+	fileHandle_t f;
+
+	len = FS_SV_FOpenFileRead(SV_SECRET_KEY_FILE, &f);
+	if (len == crypto_kx_PUBLICKEYBYTES + crypto_kx_SECRETKEYBYTES)
+	{
+		FS_Read(svs.publicKey, crypto_kx_PUBLICKEYBYTES, f);
+		FS_Read(svs.secretKey, crypto_kx_SECRETKEYBYTES, f);
+		FS_FCloseFile(f);
+	}
+	else
+	{
+		if (len > 0) FS_FCloseFile(f);
+
+		crypto_kx_keypair(svs.publicKey, svs.secretKey);
+
+		f = FS_SV_FOpenFileWrite(SV_SECRET_KEY_FILE);
+		FS_Write(svs.publicKey, crypto_kx_PUBLICKEYBYTES, f);
+		FS_Write(svs.secretKey, crypto_kx_SECRETKEYBYTES, f);
+		FS_FCloseFile(f);
+	}
+
+	sodium_bin2base64(svs.publicKeyBase64, sizeof(svs.publicKeyBase64), svs.publicKey,
+		sizeof(svs.publicKey), sodium_base64_VARIANT_ORIGINAL);
+	Com_Printf("Server public key: %s\n", svs.publicKeyBase64);
+}
+#endif
+
 /*
 ===============
 SV_Init
@@ -646,6 +688,9 @@ void SV_Init (void)
 	sv_minPing = Cvar_Get ("sv_minPing", "0", CVAR_ARCHIVE | CVAR_SERVERINFO );
 	sv_maxPing = Cvar_Get ("sv_maxPing", "0", CVAR_ARCHIVE | CVAR_SERVERINFO );
 	sv_floodProtect = Cvar_Get ("sv_floodProtect", "1", CVAR_ARCHIVE | CVAR_SERVERINFO );
+#ifdef USE_LIBSODIUM
+	sv_encryption = Cvar_Get ("sv_encryption", "1", CVAR_ARCHIVE | CVAR_SERVERINFO);
+#endif
 
 	// systeminfo
 	Cvar_Get ("sv_cheats", "1", CVAR_SYSTEMINFO | CVAR_ROM );
@@ -671,7 +716,7 @@ void SV_Init (void)
 
 	sv_allowDownload = Cvar_Get ("sv_allowDownload", "0", CVAR_SERVERINFO);
 	Cvar_Get ("sv_dlURL", "", CVAR_SERVERINFO | CVAR_ARCHIVE);
-	
+
 	sv_master[0] = Cvar_Get("sv_master1", MASTER_SERVER_NAME, 0);
 	sv_master[1] = Cvar_Get("sv_master2", "master.ioquake3.org", 0);
 	for(index = 2; index < MAX_MASTER_SERVERS; index++)
@@ -693,9 +738,13 @@ void SV_Init (void)
 
 	// init the botlib here because we need the pre-compiler in the UI
 	SV_BotInitBotLib();
-	
+
 	// Load saved bans
 	Cbuf_AddText("rehashbans\n");
+
+#ifdef USE_LIBSODIUM
+	SV_LoadKeys();
+#endif
 }
 
 
@@ -712,7 +761,7 @@ to totally exit after returning from this function.
 void SV_FinalMessage( char *message ) {
 	int			i, j;
 	client_t	*cl;
-	
+
 	// send it twice, ignoring rate
 	for ( j = 0 ; j < 2 ; j++ ) {
 		for (i=0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++) {
@@ -746,6 +795,7 @@ void SV_Shutdown( char *finalmsg ) {
 
 	Com_Printf( "----- Server Shutdown (%s) -----\n", finalmsg );
 
+	NET_ScionServerStop();
 	NET_LeaveMulticast6();
 
 	if ( svs.clients && !com_errorEntered ) {
@@ -763,10 +813,10 @@ void SV_Shutdown( char *finalmsg ) {
 	if(svs.clients)
 	{
 		int index;
-		
+
 		for(index = 0; index < sv_maxclients->integer; index++)
 			SV_FreeClient(&svs.clients[index]);
-		
+
 		Z_Free(svs.clients);
 	}
 	Com_Memset( &svs, 0, sizeof( svs ) );
@@ -780,4 +830,3 @@ void SV_Shutdown( char *finalmsg ) {
 	if( sv_killserver->integer != 2 )
 		CL_Disconnect( qfalse );
 }
-

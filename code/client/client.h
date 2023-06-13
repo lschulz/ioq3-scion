@@ -85,7 +85,7 @@ typedef struct {
 
 // the parseEntities array must be large enough to hold PACKET_BACKUP frames of
 // entities, so that when a delta compressed message arives from the server
-// it can be un-deltad from the original 
+// it can be un-deltad from the original
 #define	MAX_PARSE_ENTITIES	( PACKET_BACKUP * MAX_SNAPSHOT_ENTITIES )
 
 extern int g_console_field_width;
@@ -264,6 +264,13 @@ typedef struct {
 
 #ifdef LEGACY_PROTOCOL
 	qboolean compat;
+#endif
+
+#ifdef USE_LIBSODIUM
+	// ephemeral keys for key exchange
+	byte publicKey[crypto_kx_PUBLICKEYBYTES];
+	byte secretKey[crypto_kx_SECRETKEYBYTES];
+	qboolean encrypted; // true if server connection is encrypted
 #endif
 
 	// big stuff at end of structure so most offsets are 15 bits or less
@@ -526,9 +533,16 @@ void CL_Voip_f( void );
 void CL_SystemInfoChanged( void );
 void CL_ParseServerMessage( msg_t *msg );
 
+//
+// cl_known_servers
+//
+void CL_InitKnownServers(void);
+void CL_FreeKnownServers(void);
+qboolean CL_VerifyServerKey(const netadr_t *server, const char *publicKey);
+
 //====================================================================
 
-void	CL_ServerInfoPacket( netadr_t from, msg_t *msg );
+void	CL_ServerInfoPacket( const netadr_t *from, msg_t *msg );
 void	CL_LocalServers_f( void );
 void	CL_GlobalServers_f( void );
 void	CL_FavoriteServers_f( void );
@@ -570,7 +584,7 @@ void	SCR_DebugGraph (float value);
 int		SCR_GetBigStringWidth( const char *str );	// returns in virtual 640x480 coordinates
 
 void	SCR_AdjustFrom640( float *x, float *y, float *w, float *h );
-void	SCR_FillRect( float x, float y, float width, float height, 
+void	SCR_FillRect( float x, float y, float width, float height,
 					 const float *color );
 void	SCR_DrawPic( float x, float y, float width, float height, qhandle_t hShader );
 void	SCR_DrawNamedPic( float x, float y, float width, float height, const char *picname );
@@ -640,4 +654,3 @@ qboolean CL_VideoRecording( void );
 // cl_main.c
 //
 void CL_WriteDemoMessage ( msg_t *msg, int headerBytes );
-

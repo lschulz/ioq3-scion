@@ -1,4 +1,60 @@
-![Build](https://github.com/ioquake/ioq3/workflows/Build/badge.svg)
+SCION ioquake3
+==============
+
+This fork of ioquake3 adds network support for the SCION Internet architecture
+and path aware networking (PAN). New features include:
+
+* Support for playing via SCION networks
+* Support for SCION master servers
+* Manual network path selection on the level of SCION autonomous systems
+* Optional encryption of client-server connection (requires libsodium, can be
+  disabled by compiling with `USE_LIBSODIUM=0` in `Makefile.local`;
+  connectionless packets are not encrypted)
+
+More information on SCION: https://www.scion.org/
+
+### Cvars
+
+* `net_enabled` bitmask has a new option to enable SCION networking.
+```
+  enable ipv4 networking:    1
+  enable ipv6 networking:    2
+  prioritise ipv6 over ipv4: 4
+  disable multicast support: 8
+  enable SCION networking  : 10
+```
+* `net_scion` Local IP address to bind to for SCION connections. Note that SCION
+  currently cannot bind to wildcard addresses.
+* `net_scion_port` UDP port for SCION connections. Due to limitations in the
+  current implementation of SCION more than a single port is needed and the
+  entire range `[net_scion_port, net_scion_port+35)` may be used for connections.
+* `net_oobTimeout` Out-of-band messages to servers the client is not currently
+  connected to require separate SCION connections. This cvar controls how long
+  these connections are kept active after the last time they have been used.
+  Value in milliseconds.
+* `sv_encryption` and `cl_encryption` enable encryption on the server and on the
+  client, respectively. Possible values:
+```
+  0 Disable encryption
+  1 Enable encryption, but fall back to unencrypted connection if opposite site
+    does not support/enable encryption
+  2 Enable encryption, connection fails if other side does not support/enable
+    encryption
+```
+
+### Console commands
+
+When connected to a SCION server, the following commands become available on the
+client:
+* `showpaths` List available network paths to the server.
+* `selectpath` Select a path by specifying a unique prefix of the 8 digit hash
+  value of every path listed by `showpaths`.
+* `nextpath` Select the next path in the list. Useful for binding to a key.
+* `prevpath` Select the previous path in the list. Useful for binding to a key.
+
+
+ioquake3
+========
 
                    ,---------------------------------------.
                    |   _                     _       ____  |
@@ -552,5 +608,3 @@ Significant contributions from
   * Vincent S. Cojot <vincent at cojot dot name>
   * optical <alex@rigbo.se>
   * Aaron Gyes <floam@aaron.gy>
-
-

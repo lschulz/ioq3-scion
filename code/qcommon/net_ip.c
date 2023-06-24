@@ -1273,7 +1273,7 @@ void Sys_SendPacket( int length, const void *data, const netadr_t *to )
 			{
 				if (scion_oob[i].adr.type == NA_BAD)
 					continue;
-				if (NET_CompareBaseAdr(to, &scion_oob[i].adr))
+				if (NET_CompareAdr(to, &scion_oob[i].adr))
 				{
 					scion_oob[i].last = Sys_Milliseconds();
 					ret = send(scion_oob[i].socket, data, length, 0);

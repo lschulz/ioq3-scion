@@ -74,7 +74,6 @@ void CL_InitKnownServers(void)
 
 			if (sscanf(line, fmt, adr, key) == 2)
 			{
-				Com_Printf("adr = %s, key = %s\n", adr, key);
 				srv = malloc(sizeof(known_server_t));
 				if (!srv) Com_Error(ERR_FATAL, "malloc failed");
 				strcpy(srv->adr, adr);

@@ -691,13 +691,13 @@ static void SV_RehashBans_f(void)
 				serverBans[index].isexception = (curpos[0] != '0');
 				serverBans[index].subnet = atoi(maskpos);
 
-				if(serverBans[index].ip.type == NA_IP &&
-				   (serverBans[index].subnet < 1 || serverBans[index].subnet > 32))
+				if((serverBans[index].ip.type == NA_IP || serverBans[index].ip.type == NA_SCION_IP) &&
+				   (serverBans[index].subnet < 0 || serverBans[index].subnet > 32))
 				{
 					serverBans[index].subnet = 32;
 				}
-				else if(serverBans[index].ip.type == NA_IP6 &&
-					(serverBans[index].subnet < 1 || serverBans[index].subnet > 128))
+				else if((serverBans[index].ip.type == NA_IP6 || serverBans[index].ip.type == NA_SCION_IP6) &&
+					(serverBans[index].subnet < 0 || serverBans[index].subnet > 128))
 				{
 					serverBans[index].subnet = 128;
 				}
@@ -797,18 +797,18 @@ static qboolean SV_ParseCIDRNotation(netadr_t *dest, int *mask, char *adrstr)
 	{
 		*mask = atoi(suffix);
 
-		if(dest->type == NA_IP)
+		if(dest->type == NA_IP || dest->type == NA_SCION_IP)
 		{
-			if(*mask < 1 || *mask > 32)
+			if(*mask < 0 || *mask > 32)
 				*mask = 32;
 		}
 		else
 		{
-			if(*mask < 1 || *mask > 128)
+			if(*mask < 0 || *mask > 128)
 				*mask = 128;
 		}
 	}
-	else if(dest->type == NA_IP)
+	else if(dest->type == NA_IP || dest->type == NA_SCION_IP)
 		*mask = 32;
 	else
 		*mask = 128;
@@ -884,14 +884,14 @@ static void SV_AddBanToList(qboolean isexception)
 		{
 			mask = atoi(Cmd_Argv(2));
 
-			if(ip.type == NA_IP)
+			if(ip.type == NA_IP || ip.type == NA_SCION_IP)
 			{
-				if(mask < 1 || mask > 32)
+				if(mask < 0 || mask > 32)
 					mask = 32;
 			}
 			else
 			{
-				if(mask < 1 || mask > 128)
+				if(mask < 0 || mask > 128)
 					mask = 128;
 			}
 		}
@@ -899,7 +899,7 @@ static void SV_AddBanToList(qboolean isexception)
 			mask = (ip.type == NA_IP6) ? 128 : 32;
 	}
 
-	if(ip.type != NA_IP && ip.type != NA_IP6)
+	if(ip.type != NA_IP && ip.type != NA_SCION_IP && ip.type != NA_IP6 && ip.type != NA_SCION_IP6)
 	{
 		Com_Printf("Error: Can ban players connected via the internet only.\n");
 		return;

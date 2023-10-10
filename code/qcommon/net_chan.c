@@ -351,23 +351,23 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 		if (msg->cursize < hdrAndNonce)
 			return qfalse;
 
-		// Cyphertext follows unencrypted header
+		// Ciphertext follows unencrypted header
 		unsigned long long clen = msg->cursize - hdrAndNonce;
-		byte *cyphertext = msg->data + hdrLen;
+		byte *ciphertext = msg->data + hdrLen;
 
 		// Nonce is at the end of the packet
 		byte *nonce = msg->data + msg->cursize - crypto_aead_chacha20poly1305_NPUBBYTES;
 
 		// Decrypt directly into the message buffer
 		unsigned long long outlen = msg->maxsize - hdrLen;
-		int ret = crypto_aead_chacha20poly1305_decrypt(cyphertext, &outlen, NULL,
-			cyphertext, clen, msg->data, hdrLen, nonce, chan->rxKey);
+		int ret = crypto_aead_chacha20poly1305_decrypt(ciphertext, &outlen, NULL,
+			ciphertext, clen, msg->data, hdrLen, nonce, chan->rxKey);
 		if (ret) {
 			Com_Printf("WARNING: Netchan_Process: Message verification failed\n");
 			return qfalse;
 		}
 
-		// Through away the nonce
+		// Throw away the nonce
 		msg->cursize = outlen + hdrLen;
 	}
 #endif

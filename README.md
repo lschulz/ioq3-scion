@@ -52,6 +52,9 @@ client:
 * `nextpath` Select the next path in the list. Useful for binding to a key.
 * `prevpath` Select the previous path in the list. Useful for binding to a key.
 
+Changed console commands:
+* `clientinfo` Prints encryption status in addition to server address.
+* `status` Shows which client connections are encrypted.
 
 ioquake3
 ========

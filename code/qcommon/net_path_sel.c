@@ -75,7 +75,7 @@ static void copyPaths(PanPath *paths, size_t count)
 
 static void printPath(const scion_path_t *path)
 {
-	char str[128];
+	char str[1024];
 	char *pathStr = PanPathToString(path->path);
 	if (pathStr)
 	{

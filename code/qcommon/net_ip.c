@@ -26,6 +26,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #ifdef _WIN32
 #	include <winsock2.h>
 #	include <ws2tcpip.h>
+#	include <afunix.h>
 #	if WINVER < 0x501
 #		ifdef __MINGW32__
 			// wspiapi.h isn't available on MinGW, so if it's
@@ -46,12 +47,15 @@ typedef int socklen_t;
 typedef unsigned short sa_family_t;
 #	endif
 
-#	define EAGAIN					WSAEWOULDBLOCK
+#ifndef EAGAIN
+#	define EAGAIN			WSAEWOULDBLOCK
 #	define EADDRNOTAVAIL	WSAEADDRNOTAVAIL
 #	define EAFNOSUPPORT		WSAEAFNOSUPPORT
-#	define ECONNRESET			WSAECONNRESET
+#	define ECONNRESET		WSAECONNRESET
+#endif
 typedef u_long	ioctlarg_t;
-#	define socketError		WSAGetLastError( )
+#	define socketError			WSAGetLastError( )
+#	define setSocketError(err)	WSASetLastError(err)
 
 static WSADATA	winsockdata;
 static qboolean	winsockInitialized = qfalse;
@@ -72,6 +76,7 @@ static qboolean	winsockInitialized = qfalse;
 #	include <sys/ioctl.h>
 #	include <sys/types.h>
 #	include <sys/time.h>
+#	include <sys/un.h>
 #	include <unistd.h>
 #	if !defined(__sun) && !defined(__sgi)
 #		include <ifaddrs.h>
@@ -88,10 +93,9 @@ typedef int SOCKET;
 #	define ioctlsocket			ioctl
 typedef int	ioctlarg_t;
 #	define socketError			errno
+#	define setSocketError(err)	errno = err
 
 #endif
-
-#include <sys/un.h>
 
 PanSelector NET_PathSelInit(void);
 void NET_PathSelDestroy(void);
@@ -127,27 +131,49 @@ static SOCKET	socks_socket = INVALID_SOCKET;
 static SOCKET	multicast6_socket = INVALID_SOCKET;
 
 // SCION server side connection (not connected)
-static PanListenConn		scion_server_conn = PAN_INVALID_HANDLE;
-static PanListenSockAdapter	scion_server_adapter = PAN_INVALID_HANDLE;
-static SOCKET				scion_server_socket = INVALID_SOCKET;
+static PanListenConn	scion_server_conn = PAN_INVALID_HANDLE;
+static PanListenAdapter	scion_server_adapter = PAN_INVALID_HANDLE;
+static SOCKET			scion_server_socket = INVALID_SOCKET;
 
 // SCION client side connection (connected to scion_client_remote)
-static netadr_t				scion_client_remote = {0};
-static PanConn				scion_client_conn = PAN_INVALID_HANDLE;
-static PanConnSockAdapter	scion_client_adapter = PAN_INVALID_HANDLE;
-static SOCKET				scion_client_socket = INVALID_SOCKET;
+static netadr_t			scion_client_remote = {0};
+static PanConn			scion_client_conn = PAN_INVALID_HANDLE;
+static PanConnAdapter	scion_client_adapter = PAN_INVALID_HANDLE;
+static SOCKET			scion_client_socket = INVALID_SOCKET;
+
+#define PAN_BUFFER_SIZE 2048
+
+#ifdef PAN_UNIX_STREAM
+
+// Buffer for reassembling packets received from the PAN Unix stream socket.
+// Initialize/reset by setting everything to zero.
+typedef struct
+{
+	uint32_t msglen; // expected packet length
+	uint32_t recvd;  // number of bytes in buffer
+	byte packet[PAN_BUFFER_SIZE];
+} stream_buffer_t;
+
+static stream_buffer_t scion_server_buffer = { 0, 0, {0} };
+static stream_buffer_t scion_client_buffer = { 0, 0, {0} };
+
+#endif // PAN_UNIX_STREAM
 
 // Pool of temporary SCION sockets for out-of-band messages that cannot be
 // handled by scion_server or scion_client connections.
 #define MAX_OOB_CONNECTIONS 32
 typedef struct
 {
-	netadr_t			adr;		// remote address, NA_BAD if slot is not in use
-	int					last;		// time the connection was last used
-	PanConn				conn;		// PAN connection
-	PanConnSockAdapter	adapter;	// Unix socket adapter
-	SOCKET				socket;		// Unix socket
+	netadr_t		adr;		// remote address, NA_BAD if slot is not in use
+	int				last;		// time the connection was last used
+	PanConn			conn;		// PAN connection
+	PanConnAdapter	adapter;	// Unix socket adapter
+	SOCKET			socket;		// Unix socket
+#ifdef PAN_UNIX_STREAM
+	stream_buffer_t buffer;
+#endif
 } scion_oob_t;
+
 static scion_oob_t scion_oob[MAX_OOB_CONNECTIONS] = {0};
 
 // Keep track of currently joined multicast group.
@@ -663,7 +689,7 @@ PanUDPAddr NET_AddressToPan(const netadr_t *to)
 ====================
 NET_PanUnixSocket
 
-Create a Unix domain socket pair for asnchronous communication with PAN.
+Create a Unix domain socket pair for asynchronous communication with PAN.
 ====================
 */
 static qboolean NET_PanUnixSocket(
@@ -673,15 +699,15 @@ static qboolean NET_PanUnixSocket(
 	PanError err = PAN_ERR_OK;
 	ioctlarg_t _true = 1;
 
-	// Create PAN end of unix socket pair
+	// Create PAN end of Unix socket pair
 	if (listen) {
-		err = PanNewListenSockAdapter(conn, pan_addr, local_addr, pan_sock);
+		err = PanNewListenAdapter(conn, pan_addr, local_addr, pan_sock);
 		if (err) {
 			Com_Printf("WARNING: NET_PanUnixSocket: PanNewListenSockAdapter failed (%d)\n", err);
 			return qfalse;
 		}
 	} else {
-		err = PanNewConnSockAdapter(conn, pan_addr, local_addr, pan_sock);
+		err = PanNewConnAdapter(conn, pan_addr, local_addr, pan_sock);
 		if (err) {
 			Com_Printf("WARNING: NET_PanUnixSocket: PanNewConnSockAdapter failed (%d)\n", err);
 			goto pan_cleanup;
@@ -689,16 +715,14 @@ static qboolean NET_PanUnixSocket(
 	}
 
 	// Create C end of Unix socket pair
+#ifndef PAN_UNIX_STREAM
 	*sock = socket(PF_UNIX, SOCK_DGRAM, 0);
+#else
+	*sock = socket(PF_UNIX, SOCK_STREAM, 0);
+#endif
 	if (*sock == INVALID_SOCKET) {
 		Com_Printf("WARNING: NET_PanUnixSocket: socket: %s\n", NET_ErrorString());
 		goto pan_cleanup;
-	}
-
-	// Make domain socket non-blocking
-	if (ioctlsocket(*sock, FIONBIO, &_true) == SOCKET_ERROR) {
-		Com_Printf("WARNING: NET_PanUnixSocket: ioctl FIONBIO: %s\n", NET_ErrorString());
-		goto socket_cleanup;
 	}
 
 	// Bind C socket
@@ -720,6 +744,12 @@ static qboolean NET_PanUnixSocket(
 		goto socket_cleanup;
 	}
 
+	// Make domain socket non-blocking
+	if (ioctlsocket(*sock, FIONBIO, &_true) == SOCKET_ERROR) {
+		Com_Printf("WARNING: NET_PanUnixSocket: ioctl FIONBIO: %s\n", NET_ErrorString());
+		goto socket_cleanup;
+	}
+
 	return qtrue;
 
 socket_cleanup:
@@ -727,9 +757,9 @@ socket_cleanup:
 	*sock = INVALID_SOCKET;
 pan_cleanup:
 	if (listen)
-		PanListenSockAdapterClose(*pan_sock);
+		PanListenAdapterClose(*pan_sock);
 	else
-		PanConnSockAdapterClose(*pan_sock);
+		PanConnAdapterClose(*pan_sock);
 	PanDeleteHandle(*pan_sock);
 	*pan_sock = PAN_INVALID_HANDLE;
 	return qfalse;
@@ -750,12 +780,12 @@ static void NET_ClearOOBSlot(int i)
 	if (scion_oob[i].socket)
 	{
 		closesocket(scion_oob[i].socket);
-		Com_sprintf(path, sizeof(path), "/tmp/ioquake3_%d_oob_%d.sock", getpid(), i);
+		Com_sprintf(path, sizeof(path), "%s/ioquake3_%d_oob_%d.sock", Sys_TempPath(), Sys_PID(), i);
 		unlink(path);
 	}
 	if (scion_oob[i].adapter)
 	{
-		PanConnSockAdapterClose(scion_oob[i].adapter);
+		PanConnAdapterClose(scion_oob[i].adapter);
 		PanDeleteHandle(scion_oob[i].adapter);
 	}
 	if (scion_oob[i].conn)
@@ -814,9 +844,10 @@ static int NET_OpenOOBConn(const netadr_t *to)
 		return -1;
 	}
 
-	pid_t pid = getpid();
-	Com_sprintf(pan_addr, sizeof(pan_addr), "/tmp/ioquake3_%d_oob_pan_%d.sock", pid, i);
-	Com_sprintf(loc_addr, sizeof(loc_addr), "/tmp/ioquake3_%d_oob_%d.sock", pid, i);
+	const char *tmp = Sys_TempPath();
+	int pid = Sys_PID();
+	Com_sprintf(pan_addr, sizeof(pan_addr), "%s/ioquake3_%d_oob_pan_%d.sock", tmp, pid, i);
+	Com_sprintf(loc_addr, sizeof(loc_addr), "%s/ioquake3_%d_oob_%d.sock", tmp, pid, i);
 	if (!NET_PanUnixSocket(slot->conn, pan_addr, loc_addr, &slot->adapter, &slot->socket, qfalse))
 	{
 		NET_ClearOOBSlot(i);
@@ -878,9 +909,10 @@ void NET_ScionServerStart(void)
 
 	if (scion_server_adapter == PAN_INVALID_HANDLE && scion_server_socket == INVALID_SOCKET)
 	{
-		pid_t pid = getpid();
-		Com_sprintf(pan_addr, sizeof(pan_addr), "/tmp/ioquake3_%d_server_pan.sock", pid);
-		Com_sprintf(loc_addr, sizeof(loc_addr), "/tmp/ioquake3_%d_server.sock", pid);
+		const char *tmp = Sys_TempPath();
+		int pid = Sys_PID();
+		Com_sprintf(pan_addr, sizeof(pan_addr), "%s/ioquake3_%d_server_pan.sock", tmp, pid);
+		Com_sprintf(loc_addr, sizeof(loc_addr), "%s/ioquake3_%d_server.sock", tmp, pid);
 		if (!NET_PanUnixSocket(scion_server_conn, pan_addr, loc_addr,
 				&scion_server_adapter, &scion_server_socket, qtrue)) {
 			Com_Printf( "WARNING: Couldn't create PAN domain socket pair.\n");
@@ -905,12 +937,12 @@ void NET_ScionServerStop(void)
 	if ( scion_server_socket != INVALID_SOCKET ) {
 		closesocket( scion_server_socket );
 		scion_server_socket = INVALID_SOCKET;
-		Com_sprintf(path, sizeof(path), "/tmp/ioquake3_%d_server.sock", getpid());
+		Com_sprintf(path, sizeof(path), "%s/ioquake3_%d_server.sock", Sys_TempPath(), Sys_PID());
 		unlink(path);
 	}
 
 	if ( scion_server_adapter != PAN_INVALID_HANDLE ) {
-		PanListenSockAdapterClose( scion_server_adapter );
+		PanListenAdapterClose( scion_server_adapter );
 		PanDeleteHandle ( scion_server_adapter );
 		scion_server_adapter = PAN_INVALID_HANDLE;
 	}
@@ -963,9 +995,10 @@ qboolean NET_ScionClientConnect(const netadr_t *to)
 	}
 
 	// Create Unix socket pair for dialed PAN connection.
-	pid_t pid = getpid();
-	Com_sprintf(pan_addr, sizeof(pan_addr), "/tmp/ioquake3_client_pan_%d.sock", pid);
-	Com_sprintf(loc_addr, sizeof(loc_addr), "/tmp/ioquake3_client_%d.sock", pid);
+	const char *tmp = Sys_TempPath();
+	int pid = Sys_PID();
+	Com_sprintf(pan_addr, sizeof(pan_addr), "%s/ioquake3_client_pan_%d.sock", tmp, pid);
+	Com_sprintf(loc_addr, sizeof(loc_addr), "%s/ioquake3_client_%d.sock", tmp, pid);
 	if (!NET_PanUnixSocket(scion_client_conn, pan_addr, loc_addr,
 		 &scion_client_adapter, &scion_client_socket, qfalse)) {
 		PanConnClose(scion_client_conn);
@@ -992,12 +1025,12 @@ void NET_ScionClientClose(void)
 	if (scion_client_socket) {
 		closesocket(scion_client_socket);
 		scion_client_socket = INVALID_SOCKET;
-		Com_sprintf(path, sizeof(path), "/tmp/ioquake3_client_%d.sock", getpid());
+		Com_sprintf(path, sizeof(path), "%s/ioquake3_client_%d.sock", Sys_TempPath(), Sys_PID());
 		unlink(path);
 	}
 
 	if (scion_client_adapter != PAN_INVALID_HANDLE) {
-		PanConnSockAdapterClose(scion_client_adapter);
+		PanConnAdapterClose(scion_client_adapter);
 		PanDeleteHandle(scion_client_adapter);
 		scion_client_adapter = PAN_INVALID_HANDLE;
 	}
@@ -1015,6 +1048,64 @@ void NET_ScionClientClose(void)
 
 //=============================================================================
 
+#ifdef PAN_UNIX_STREAM
+/*
+==================
+NET_RecvPktFromStream
+
+Receive a packet from a PAN Unix stream socket. Returns SOCKET_ERROR and sets
+errno to EAGAIN if no complete packet was avaialble yet.
+==================
+*/
+int NET_RecvPktFromStream(SOCKET sock, void *pkt, int maxlen, stream_buffer_t *buffer)
+{
+	int ret = 0;
+	uint32_t rem = 0;
+
+	// Receive length header
+	if (buffer->msglen == 0)
+	{
+		rem = PAN_STREAM_HDR_SIZE - buffer->recvd;
+		ret = recv(sock, (char*)(&buffer->packet[buffer->recvd]), rem, 0);
+		if (ret < 0) return SOCKET_ERROR;
+
+		buffer->recvd += (uint32_t)ret;
+		if (buffer->recvd < PAN_STREAM_HDR_SIZE)
+		{
+			setSocketError(EAGAIN);
+			return SOCKET_ERROR;
+		}
+
+		memcpy(&buffer->msglen, buffer->packet, PAN_STREAM_HDR_SIZE);
+		if (buffer->msglen > MIN(maxlen, PAN_BUFFER_SIZE))
+		{
+			Com_Printf("ERROR: Oversize packet\n");
+			exit(1);
+		}
+		buffer->recvd = 0;
+	}
+
+	// Receive packet
+	rem = buffer->msglen - buffer->recvd;
+	ret = recv(sock, (char*)&buffer->packet[buffer->recvd], rem, 0);
+	if (ret < 0) return SOCKET_ERROR;
+
+	buffer->recvd += (uint32_t)ret;
+	if (buffer->recvd < buffer->msglen)
+	{
+		setSocketError(EAGAIN);
+		return SOCKET_ERROR;
+	}
+
+	memcpy(pkt, buffer->packet, buffer->recvd);
+	ret = (int)buffer->recvd;
+	buffer->msglen = 0;
+	buffer->recvd = 0;
+
+	return ret;
+}
+#endif // PAN_UNIX_STREAM
+
 /*
 ==================
 NET_GetPacket
@@ -1024,10 +1115,10 @@ Receive one packet
 */
 qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 {
-	int 	ret;
-	struct sockaddr_storage from;
-	socklen_t	fromlen;
-	int		err;
+	int						ret;
+	struct sockaddr_storage	from;
+	socklen_t				fromlen;
+	int						err;
 
 	if(ip_socket != INVALID_SOCKET && FD_ISSET(ip_socket, fdr))
 	{
@@ -1131,9 +1222,13 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 
 	if(scion_server_socket != INVALID_SOCKET && FD_ISSET(scion_server_socket, fdr))
 	{
-		byte packet[MAX_PACKETLEN + PAN_ADDR_HDR_SIZE];
-		ret = recv(scion_server_socket, packet, sizeof(packet), 0);
+		byte packet[PAN_BUFFER_SIZE];
 
+	#ifdef PAN_UNIX_STREAM
+		ret = NET_RecvPktFromStream(scion_server_socket, packet, sizeof(packet), &scion_server_buffer);
+	#else
+		ret = recv(scion_server_socket, packet, sizeof(packet), 0);
+	#endif
 		if (ret == SOCKET_ERROR)
 		{
 			err = socketError;
@@ -1169,8 +1264,12 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 
 	if(scion_client_socket != INVALID_SOCKET && FD_ISSET(scion_client_socket, fdr))
 	{
+	#ifdef PAN_UNIX_STREAM
+		ret = NET_RecvPktFromStream(scion_client_socket,
+			(void*)net_message->data, net_message->maxsize, &scion_client_buffer);
+	#else
 		ret = recv(scion_client_socket, (void*)net_message->data, net_message->maxsize, 0);
-
+	#endif
 		if (ret == SOCKET_ERROR)
 		{
 			err = socketError;
@@ -1199,8 +1298,12 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 			continue;
 		if (FD_ISSET(scion_oob[i].socket, fdr))
 		{
+		#ifdef PAN_UNIX_STREAM
+			ret = NET_RecvPktFromStream(scion_oob[i].socket,
+				(void*)net_message->data, net_message->maxsize, &scion_oob[i].buffer);
+		#else
 			ret = recv(scion_oob[i].socket, (void*)net_message->data, net_message->maxsize, 0);
-
+		#endif
 			if (ret == SOCKET_ERROR)
 			{
 				err = socketError;
@@ -1230,6 +1333,40 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 //=============================================================================
 
 static char socksBuf[4096];
+
+#ifdef PAN_UNIX_STREAM
+/*
+==================
+Sys_SendPktOnStream
+
+Send a packet on a PAN Unix stream socket. Packet boundaries are preserved by
+prepending a 4-byte length header.
+==================
+*/
+int Sys_SendPktOnStream(SOCKET sock, const void *data, int length)
+{
+	int ret = 0;
+	char hdr[PAN_STREAM_HDR_SIZE];
+	memcpy(hdr, &length, PAN_STREAM_HDR_SIZE);
+
+	ret = send(sock, hdr, PAN_STREAM_HDR_SIZE, 0);
+	if (ret < 0) return ret;
+	if (ret < PAN_STREAM_HDR_SIZE)
+	{
+		Com_Printf("ERROR: PAN Unix stream overflow\n");
+		exit(1);
+	}
+
+	ret = send(sock, data, length, 0);
+	if (ret < length)
+	{
+		Com_Printf("ERROR: PAN Unix stream overflow\n");
+		exit(1);
+	}
+
+	return ret;
+}
+#endif // PAN_UNIX_STREAM
 
 /*
 ==================
@@ -1264,7 +1401,11 @@ void Sys_SendPacket( int length, const void *data, const netadr_t *to )
 		qboolean sent = qfalse;
 		if (scion_client_socket && NET_CompareBaseAdr(to, &scion_client_remote))
 		{
+		#ifdef PAN_UNIX_STREAM
+			ret = Sys_SendPktOnStream(scion_client_socket, data, length);
+		#else
 			ret = send(scion_client_socket, data, length, 0);
+		#endif
 			sent = qtrue;
 		}
 		if (!sent)
@@ -1276,7 +1417,11 @@ void Sys_SendPacket( int length, const void *data, const netadr_t *to )
 				if (NET_CompareAdr(to, &scion_oob[i].adr))
 				{
 					scion_oob[i].last = Sys_Milliseconds();
+				#ifdef PAN_UNIX_STREAM
+					ret = Sys_SendPktOnStream(scion_oob[i].socket, data, length);
+				#else
 					ret = send(scion_oob[i].socket, data, length, 0);
+				#endif
 					sent = qtrue;
 				}
 			}
@@ -1293,7 +1438,11 @@ void Sys_SendPacket( int length, const void *data, const netadr_t *to )
 			int i = NET_OpenOOBConn(to);
 			if (i >= 0)
 			{
+			#ifdef PAN_UNIX_STREAM
+				ret = Sys_SendPktOnStream(scion_oob[i].socket, data, length);
+			#else
 				ret = send(scion_oob[i].socket, data, length, 0);
+			#endif
 				sent = qtrue;
 			}
 		}

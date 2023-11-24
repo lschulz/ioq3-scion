@@ -23,7 +23,6 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "q_shared.h"
 #include "qcommon.h"
 #include <pan/pan.h>
-#include <arpa/inet.h>
 
 /*
 
@@ -53,6 +52,7 @@ to the new value before sending out any replies.
 #else
 #define CRYPTO_OVERHEAD         (crypto_aead_chacha20poly1305_ABYTES + crypto_aead_chacha20poly1305_NPUBBYTES)
 #endif
+#define	MAX_PACKETLEN			1200		// max size of a network packet
 #define	FRAGMENT_SIZE			(MAX_PACKETLEN - 100 - CRYPTO_OVERHEAD)
 #define	PACKET_HEADER			10			// two ints and a short
 

@@ -256,9 +256,9 @@ PanPath SV_GetPathToMaster(int length, const void *message, const netadr_t *to)
 	err = PanConnWrite(conn, message, length, NULL);
 	if (err) goto conn_cleanup;
 
-	char response[MAX_PACKETLEN];
+	char response[1024];
 	PanConnSetReadDeadline(conn, 1000);
-	err = PanConnReadVia(conn, response, MAX_PACKETLEN, &ret, NULL);
+	err = PanConnReadVia(conn, response, sizeof(response), &ret, NULL);
 	if (err == PAN_ERR_DEADLINE)
 		Com_Printf("SV_GetPathToMaster: Master server not responding\n");
 

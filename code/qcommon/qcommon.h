@@ -36,6 +36,22 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #endif
 #endif
 
+#ifndef PAN_UNIX_STREAM
+typedef PanListenSockAdapter	PanListenAdapter;
+typedef PanConnSockAdapter		PanConnAdapter;
+#define PanNewListenAdapter(conn, pan, local, sock) PanNewListenSockAdapter(conn, pan, local, sock)
+#define PanNewConnAdapter(conn, pan, local, sock) PanNewConnSockAdapter(conn, pan, local, sock)
+#define PanListenAdapterClose(sock) PanListenSockAdapterClose(sock)
+#define PanConnAdapterClose(sock) PanConnSockAdapterClose(sock)
+#else
+typedef PanListenSSockAdapter	PanListenAdapter;
+typedef PanConnSSockAdapter		PanConnAdapter;
+#define PanNewListenAdapter(conn, pan, local, sock)	PanNewListenSSockAdapter(conn, pan, sock)
+#define PanNewConnAdapter(conn, pan, local, sock) PanNewConnSSockAdapter(conn, pan, sock)
+#define PanListenAdapterClose(sock) PanListenSSockAdapterClose(sock)
+#define PanConnAdapterClose(sock) PanConnSSockAdapterClose(sock)
+#endif
+
 //#define	PRE_RELEASE_DEMO
 
 //============================================================================
@@ -216,8 +232,6 @@ void		NET_Sleep(int msec);
 /*
 Netchan handles packet fragmentation and out of order / duplicate suppression
 */
-
-#define	MAX_PACKETLEN 1200 // max size of a network packet
 
 typedef struct {
 	netsrc_t	sock;
@@ -1163,6 +1177,7 @@ char    *Sys_DefaultAppPath(void);
 
 void  Sys_SetDefaultHomePath(const char *path);
 char	*Sys_DefaultHomePath(void);
+const char *Sys_TempPath(void);
 const char *Sys_Dirname( char *path );
 const char *Sys_Basename( char *path );
 char *Sys_ConsoleInput(void);
@@ -1174,6 +1189,7 @@ void	Sys_Sleep(int msec);
 qboolean Sys_LowPhysicalMemory( void );
 
 void Sys_SetEnv(const char *name, const char *value);
+int Sys_PID(void);
 
 typedef enum
 {

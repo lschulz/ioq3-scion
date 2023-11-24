@@ -693,6 +693,9 @@ ifdef MINGW
   BASE_CFLAGS = -Wall -fno-strict-aliasing -Wimplicit -Wstrict-prototypes \
     -DUSE_ICON
 
+  CLIENT_CFLAGS += -DPAN_UNIX_STREAM
+  SERVER_CFLAGS += -DPAN_UNIX_STREAM
+
   # In the absence of wspiapi.h, require Windows XP or later
   ifeq ($(shell test -e $(CMDIR)/wspiapi.h; echo $$?),1)
     BASE_CFLAGS += -DWINVER=0x501
@@ -750,7 +753,8 @@ ifdef MINGW
   ifneq ("$(CC)", $(findstring "$(CC)", "clang" "clang++"))
     CLIENT_LDFLAGS += -mwindows
   endif
-  CLIENT_LIBS = -lgdi32 -lole32
+  CLIENT_LIBS = -lgdi32 -lole32 -lpan
+  DEDICATED_LIBS = -lpan
   RENDERER_LIBS = -lgdi32 -lole32 -static-libgcc
 
   ifeq ($(USE_FREETYPE),1)
@@ -771,6 +775,11 @@ ifdef MINGW
         CLIENT_LIBS += $(CURL_LIBS)
       endif
     endif
+  endif
+
+  ifeq ($(USE_LIBSODIUM),1)
+    CLIENT_LIBS += -lsodium
+    DEDICATED_LIBS += -lsodium
   endif
 
   ifeq ($(ARCH),x86)

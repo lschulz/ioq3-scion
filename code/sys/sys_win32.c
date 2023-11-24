@@ -74,7 +74,7 @@ Set FPU control word to default value
   #define _MCW_PC	0x00030000U
   #define _RC_NEAR      0x00000000U
   #define _PC_53	0x00010000U
-  
+
   unsigned int _controlfp(unsigned int new, unsigned int mask);
 #endif
 
@@ -126,7 +126,7 @@ char *Sys_DefaultHomePath( void )
 			FreeLibrary(shfolder);
 			return NULL;
 		}
-		
+
 		Com_sprintf(homePath, sizeof(homePath), "%s%c", szPath, PATH_SEP);
 
 		if(com_homepath->string[0])
@@ -137,6 +137,22 @@ char *Sys_DefaultHomePath( void )
 
 	FreeLibrary(shfolder);
 	return homePath;
+}
+
+/*
+==================
+Sys_TempPath
+==================
+*/
+const char *Sys_TempPath(void)
+{
+	static char tempDir[MAX_OSPATH] = "";
+	if (!tempDir[0])
+	{
+		if (!GetTempPathA(MAX_OSPATH, tempDir))
+			Q_strncpyz(tempDir, "C:\\temp\\", MAX_OSPATH);
+	}
+	return tempDir;
 }
 
 /*
@@ -233,7 +249,7 @@ Sys_MicrosoftStorePath
 char* Sys_MicrosoftStorePath(void)
 {
 #ifdef MSSTORE_PATH
-	if (!microsoftStorePath[0]) 
+	if (!microsoftStorePath[0])
 	{
 		TCHAR szPath[MAX_PATH];
 		FARPROC qSHGetFolderPath;
@@ -834,8 +850,8 @@ void Sys_PlatformInit( void )
 			Com_Printf("Warning: Minimum supported timer resolution is %ums "
 				"on this system, recommended resolution 1ms\n", timerResolution);
 		}
-		
-		timeBeginPeriod(timerResolution);				
+
+		timeBeginPeriod(timerResolution);
 	}
 	else
 		timerResolution = 0;

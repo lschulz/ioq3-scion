@@ -88,6 +88,24 @@ char *Sys_DefaultHomePath(void)
 }
 
 /*
+==================
+Sys_TempPath
+==================
+*/
+const char *Sys_TempPath(void)
+{
+	static char tmpDir[MAX_OSPATH] = "";
+	if (!tmpDir[0])
+	{
+		char *tmp = NULL;
+		if ((tmp = getenv("TMPDIR")));
+		else tmp = "/tmp";
+		Com_sprintf(tmpDir, sizeof(tmpDir), "%s%c", tmp, PATH_SEP);
+	}
+	return tmpDir;
+}
+
+/*
 ================
 Sys_SteamPath
 ================

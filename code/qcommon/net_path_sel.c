@@ -49,9 +49,9 @@ static PanSelector pathSelHandle = PAN_INVALID_HANDLE;
 
 static void hashPath(const char *path, char hash[9])
 {
-	uint32_t h = 0;
+	uint32_t h = 5381;
 	for (unsigned int i = 0; path[i]; ++i)
-		h ^= (uint32_t)path[i] << (8 * (i % 4));
+		h = ((h << 5) + h) + (uint32_t)path[i];
 	Com_sprintf(hash, 9, "%08x", h);
 }
 

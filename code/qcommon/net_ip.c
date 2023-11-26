@@ -2397,6 +2397,8 @@ void NET_Config( qboolean enableNetworking ) {
 		if (net_enabled->integer & NET_ENABLE_SCION)
 			scionServerAddress = scion_client_remote;
 
+		for (int i = 0; i < MAX_OOB_CONNECTIONS; ++i)
+			NET_ClearOOBSlot(i);
 		NET_ScionServerStop();
 		NET_ScionClientClose();
 	}

@@ -383,7 +383,7 @@ void SV_DirectConnect( const netadr_t *from ) {
 	qport = atoi( Info_ValueForKey( userinfo, "qport" ) );
 
 #ifdef USE_LIBSODIUM
-	if (sv_encryption->integer > 0)
+	if (sv_encryption->integer > 0 && from->type != NA_LOOPBACK)
 	{
 		clKey = Info_ValueForKey(userinfo, "key");
 		if (*clKey == '\0' && sv_encryption->integer > 1)

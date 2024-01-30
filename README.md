@@ -13,6 +13,34 @@ and path aware networking (PAN). New features include:
 
 More information on SCION: https://www.scion.org/
 
+### Compilation and Installation
+The SCION PAN library and [PAN C bindings](https://github.com/lschulz/pan-bindings)
+are required for building. Currently builds for Linux and Windows (via MinGW),
+however SCION is not well supported on Windows at the moment.
+
+Runing ioquake3 with SCION support requires a working SCION end host stack. Be
+aware that the PAN library terminates the application if the SCION services are
+not running but SCION sockets have been enable via `net_enabled`. The easiest
+way to get connected to a SCION network is [SCIONLab](https://www.scionlab.org/)
+which offers [deb packages](https://docs.scionlab.org/content/install/pkg.html)
+for installation. When installed from source, SCION also comes with a setup
+script for [local testing](https://docs.scion.org/en/latest/dev/run.html).
+
+A script for installing the Quake 3 demo on a SCIONLab machine is provided here:
+https://gist.github.com/lschulz/6f116131830ee39f05664ecc627544c3
+
+### SCION-enabled Servers
+We operate the following master servers using a [fork of
+dpmaster](https://github.com/lschulz/dpmaster-scion):
+- In SCIONLab: 19-ffaa:1:1087,10.255.255.1:27950
+- In the SCION production network: 71-2:0:4a,141.44.25.153:27950
+
+Game servers are hosted at:
+- In SCIONLab:
+  - 19-ffaa:1:1087,10.255.255.1:27960
+- In the SCION production network:
+  - 71-2:0:4a,141.44.25.153:27950
+
 ### Cvars
 
 * `net_enabled` bitmask has a new option to enable SCION networking.
@@ -55,6 +83,10 @@ client:
 Changed console commands:
 * `clientinfo` Prints encryption status in addition to server address.
 * `status` Shows which client connections are encrypted.
+
+### Misc
+
+Protocol decoder for Scapy: [misc/scapy/quake3.py](misc/scapy/quake3.py)
 
 ioquake3
 ========

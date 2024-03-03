@@ -39,7 +39,7 @@ Game servers are hosted at:
 - In SCIONLab:
   - 19-ffaa:1:1087,10.255.255.1:27960
 - In the SCION production network:
-  - 71-2:0:4a,141.44.25.153:27950
+  - 71-2:0:4a,141.44.25.153:27960
 
 ### Cvars
 

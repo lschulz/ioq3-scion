@@ -26,21 +26,6 @@ which offers [deb packages](https://docs.scionlab.org/content/install/pkg.html)
 for installation. When installed from source, SCION also comes with a setup
 script for [local testing](https://docs.scion.org/en/latest/dev/run.html).
 
-A script for installing the Quake 3 demo on a SCIONLab machine is provided here:
-https://gist.github.com/lschulz/6f116131830ee39f05664ecc627544c3
-
-### SCION-enabled Servers
-We operate the following master servers using a [fork of
-dpmaster](https://github.com/lschulz/dpmaster-scion):
-- In SCIONLab: 19-ffaa:1:1087,10.255.255.1:27950
-- In the SCION production network: 71-2:0:4a,141.44.25.153:27950
-
-Game servers are hosted at:
-- In SCIONLab:
-  - 19-ffaa:1:1087,10.255.255.1:27960
-- In the SCION production network:
-  - 71-2:0:4a,141.44.25.153:27960
-
 ### Cvars
 
 * `net_enabled` bitmask has a new option to enable SCION networking.

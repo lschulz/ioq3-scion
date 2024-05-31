@@ -1129,7 +1129,11 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 		{
 			err = socketError;
 
-			if( err != EAGAIN && err != ECONNRESET )
+		#ifdef WIN32
+			if (err != WSAEWOULDBLOCK)
+		#else
+			if (err != EAGAIN && err != ECONNRESET)
+		#endif
 				Com_Printf( "NET_GetPacket: %s\n", NET_ErrorString() );
 		}
 		else
@@ -1173,7 +1177,11 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 		{
 			err = socketError;
 
-			if( err != EAGAIN && err != ECONNRESET )
+		#ifdef WIN32
+			if (err != WSAEWOULDBLOCK)
+		#else
+			if (err != EAGAIN && err != ECONNRESET)
+		#endif
 				Com_Printf( "NET_GetPacket: %s\n", NET_ErrorString() );
 		}
 		else
@@ -1201,7 +1209,11 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 		{
 			err = socketError;
 
-			if( err != EAGAIN && err != ECONNRESET )
+		#ifdef WIN32
+			if (err != WSAEWOULDBLOCK)
+		#else
+			if (err != EAGAIN && err != ECONNRESET)
+		#endif
 				Com_Printf( "NET_GetPacket: %s\n", NET_ErrorString() );
 		}
 		else
@@ -1233,7 +1245,11 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 		{
 			err = socketError;
 
+		#ifdef WIN32
+			if (err != WSAEWOULDBLOCK)
+		#else
 			if (err != EAGAIN && err != ECONNRESET)
+		#endif
 				Com_Printf("NET_GetPacket: %s\n", NET_ErrorString());
 
 			return qfalse;
@@ -1274,7 +1290,11 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 		{
 			err = socketError;
 
+		#ifdef WIN32
+			if (err != WSAEWOULDBLOCK)
+		#else
 			if (err != EAGAIN && err != ECONNRESET)
+		#endif
 				Com_Printf("NET_GetPacket: %s\n", NET_ErrorString());
 		}
 		else
@@ -1308,7 +1328,11 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
 			{
 				err = socketError;
 
+			#ifdef WIN32
+				if (err != WSAEWOULDBLOCK)
+			#else
 				if (err != EAGAIN && err != ECONNRESET)
+			#endif
 					Com_Printf("NET_GetPacket: %s\n", NET_ErrorString());
 			}
 			else

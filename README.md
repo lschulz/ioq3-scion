@@ -15,16 +15,17 @@ More information on SCION: https://www.scion.org/
 
 ### Compilation and Installation
 The SCION PAN library and [PAN C bindings](https://github.com/lschulz/pan-bindings)
-are required for building. Currently builds for Linux and Windows (via MinGW),
-however SCION is not well supported on Windows at the moment.
+are required for building. Currently builds for Linux and Windows (via MinGW).
 
-Runing ioquake3 with SCION support requires a working SCION end host stack. Be
-aware that the PAN library terminates the application if the SCION services are
-not running but SCION sockets have been enable via `net_enabled`. The easiest
-way to get connected to a SCION network is [SCIONLab](https://www.scionlab.org/)
-which offers [deb packages](https://docs.scionlab.org/content/install/pkg.html)
-for installation. When installed from source, SCION also comes with a setup
-script for [local testing](https://docs.scion.org/en/latest/dev/run.html).
+Runing ioq3-scion requires a working SCION end host stack. The quickest way to
+get one is to build SCION from source and run a [local testing network][1]. If
+your institution is part of to the SCION production network or [SCIERA][2],
+contact your network administrator to learn how to connect to SCION. Otherwise,
+you can register for the [SCIONLab][3] test network.
+
+[1]: https://docs.scion.org/en/latest/dev/run.html
+[2]: https://sciera.readthedocs.io/en/latest/
+[3]: https://www.scionlab.org/
 
 ### Cvars
 
@@ -32,9 +33,9 @@ script for [local testing](https://docs.scion.org/en/latest/dev/run.html).
 ```
   enable ipv4 networking:    1
   enable ipv6 networking:    2
-  prioritise ipv6 over ipv4: 4
+  prioritize ipv6 over ipv4: 4
   disable multicast support: 8
-  enable SCION networking  : 10
+  enable SCION networking  : 16
 ```
 * `net_scion` Local IP address to bind to for SCION connections. Note that SCION
   currently cannot bind to wildcard addresses.
@@ -45,6 +46,12 @@ script for [local testing](https://docs.scion.org/en/latest/dev/run.html).
   connected to require separate SCION connections. This cvar controls how long
   these connections are kept active after the last time they have been used.
   Value in milliseconds.
+* `net_safeMSS` Maximum segment size (MSS) assumed for SCION paths that don't
+  have MTU metadata. Paths that do have MTU metadata and would have a MSS below
+  this value are ignored. The MSS is the MTU minus the overhead due to IP,
+  SCION, and UDP headers. The default value is 1000 bytes. Setting a lower value
+  increases the tolerance for long SCION paths with low MTUs, but will lead to
+  more packet fragmentation.
 * `sv_encryption` and `cl_encryption` enable encryption on the server and on the
   client, respectively. Possible values:
 ```
@@ -65,9 +72,14 @@ client:
 * `nextpath` Select the next path in the list. Useful for binding to a key.
 * `prevpath` Select the previous path in the list. Useful for binding to a key.
 
+SCION-enabled servers have access to the commands:
+* `showclientpaths` Print last path to connected SCION clients.
+* `clearclientpaths` Clear the remote host cache of the server's path selector.
+
 Changed console commands:
 * `clientinfo` Prints encryption status in addition to server address.
 * `status` Shows which client connections are encrypted.
+* `banaddr`, `exceptaddr`, `bandel`, and `exceptdel` accept SCION addresses.
 
 ### Misc
 

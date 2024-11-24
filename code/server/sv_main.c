@@ -163,7 +163,7 @@ void SV_AddServerCommand( client_t *client, const char *cmd ) {
 	// doesn't cause a recursive drop client
 	if ( client->reliableSequence - client->reliableAcknowledge == MAX_RELIABLE_COMMANDS + 1 ) {
 		if ( client->gamestateMessageNum == -1 )  {
-			// invalid game state message 
+			// invalid game state message
 			// this can occur in SV_DropClient() to avoid calling it more than once
 			return;
 		}
@@ -237,43 +237,40 @@ MASTER SERVER FUNCTIONS
 ================
 SV_GetPathToMaster
 
-Workaround for PAN. The listening connection of the server cannot be used to
-initiate the connection to the master server. We need to get a path to the
-master server first by creating a temporary connected PAN socket and sending
-a heartbeat to which we will get a reply (if the master server is reachable).
-The temporary connection will use a random port as PAN cannot bind two sockets
-to the same IP and port. However, we can use the path obtained with the dummy
-heartbeat to send out real heartbeat from the correct port.
+Returns a path to the given master server or an invalid handle if no path
+is available.
 ================
 */
 PanPath SV_GetPathToMaster(int length, const void *message, const netadr_t *to)
 {
-	PanPath ret = PAN_INVALID_HANDLE;
-	char local[NET_ADDRSTRMAXLEN];
+	PanPath path = PAN_INVALID_HANDLE;
+	PanIA dstIA = 0;
+	dstIA |= (PanIA)to->isd[0] << 56;
+	dstIA |= (PanIA)to->isd[1] << 48;
+	dstIA |= (PanIA)to->asn[0] << 40;
+	dstIA |= (PanIA)to->asn[1] << 32;
+	dstIA |= (PanIA)to->asn[2] << 24;
+	dstIA |= (PanIA)to->asn[3] << 16;
+	dstIA |= (PanIA)to->asn[4] << 8;
+	dstIA |= (PanIA)to->asn[5];
 
-	PanUDPAddr addr = NET_AddressToPan(to);
-	if (addr == PAN_INVALID_HANDLE) return ret;
+	PanPath *paths = NULL;
+	int n = 0;
+	PanError err = PanQueryPaths(dstIA, &paths, &n);
+	if (err || n == 0)
+	{
+		Com_Printf("SV_GetPathToMaster: No path to master server\n");
+		return path;
+	}
 
-	PanConn conn = PAN_INVALID_HANDLE;
-	NET_GetLocalForPan(local, sizeof(local), 1);
-	PanError err = PanDialUDP(local, addr, PAN_INVALID_HANDLE, PAN_INVALID_HANDLE, &conn);
-	if (err) goto addr_cleanup;
+	path = paths[0];
+	paths[0] = PAN_INVALID_HANDLE;
 
-	err = PanConnWrite(conn, message, length, NULL);
-	if (err) goto conn_cleanup;
+	for (int i = 0; i < n; ++i)
+		if (paths[i]) PanDeleteHandle(paths[i]);
+	free(paths);
 
-	char response[1024];
-	PanConnSetReadDeadline(conn, 1000);
-	err = PanConnReadVia(conn, response, sizeof(response), &ret, NULL);
-	if (err == PAN_ERR_DEADLINE)
-		Com_Printf("SV_GetPathToMaster: Master server not responding\n");
-
-conn_cleanup:
-	PanConnClose(conn);
-	PanDeleteHandle(conn);
-addr_cleanup:
-	PanDeleteHandle(addr);
-	return ret;
+	return path;
 }
 
 /*
@@ -298,6 +295,7 @@ void SV_MasterHeartbeat(const char *message)
 	int			netenabled;
 
 	netenabled = Cvar_VariableIntegerValue("net_enabled");
+	const int64_t now = 1000 * (int64_t)time(NULL); // for SCION path expiry
 
 	// "dedicated 1" is for lan play, "dedicated 2" is for inet public play
 	if (!com_dedicated || com_dedicated->integer != 2 ||
@@ -399,7 +397,8 @@ void SV_MasterHeartbeat(const char *message)
 			Com_sprintf(string, sizeof(string), "\xff\xff\xff\xffheartbeat %s\n", message);
 			int length = strlen(string);
 
-			if (!path[i]) path[i] = SV_GetPathToMaster(length, string, &adr[i][2]);
+			if (!path[i] || (PanPathGetExpiry(path[i]) < (now + 1000)))
+				path[i] = SV_GetPathToMaster(length, string, &adr[i][2]);
 			if (!path[i]) continue;
 
 			if (!Sys_SendScionPacketVia(strlen(string), string, &adr[i][2], path[i]))

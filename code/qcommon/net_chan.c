@@ -32,6 +32,7 @@ packet header
 [2	qport (only for client to server)]
 [2	fragment start byte]
 [2	fragment length. if < FRAGMENT_SIZE, this is the last fragment]
+SCION Extension: (1<<14) bit of fragment length is set on last fragment
 
 if the sequence number is -1, the packet should be handled as an out-of-band
 message instead of as part of a netcon.
@@ -47,16 +48,19 @@ to the new value before sending out any replies.
 
 */
 
+#define	MAX_PACKETLEN			1400		// max size of a network packet
+#define	FRAGMENT_SIZE			(MAX_PACKETLEN - 100)
+#define MIN_FRAGMENT_SIZE       100
+#define	PACKET_HEADER			10			// two ints and a short
 #ifndef USE_LIBSODIUM
-#define CRYPTO_OVERHEAD			0
+#define SCI_FRAGMENT_SIZE(chan)	(chan->pctx.mss - PACKET_HEADER)
 #else
 #define CRYPTO_OVERHEAD         (crypto_aead_chacha20poly1305_ABYTES + crypto_aead_chacha20poly1305_NPUBBYTES)
+#define SCI_FRAGMENT_SIZE(chan)	MAX(MIN_FRAGMENT_SIZE, (chan->pctx.mss - PACKET_HEADER - (chan->encrypted ? CRYPTO_OVERHEAD : 0)))
 #endif
-#define	MAX_PACKETLEN			1200		// max size of a network packet
-#define	FRAGMENT_SIZE			(MAX_PACKETLEN - 100 - CRYPTO_OVERHEAD)
-#define	PACKET_HEADER			10			// two ints and a short
 
-#define	FRAGMENT_BIT	(1U<<31)
+#define	FRAGMENT_BIT		(1U<<31)
+#define LAST_FRAGMENT_BIT	(1U<<14) // don't use sign bit to avoid sign extension
 
 cvar_t		*showpackets;
 cvar_t		*showdrop;
@@ -66,6 +70,9 @@ static char *netsrcString[2] = {
 	"client",
 	"server"
 };
+
+qboolean NET_ClientSelectPath(path_context_t *pctx);
+qboolean NET_ServerSelectPath(const netadr_t *remote, path_context_t *pctx);
 
 /*
 ===============
@@ -97,6 +104,12 @@ void Netchan_Setup(netsrc_t sock, netchan_t *chan, const netadr_t *adr, int qpor
 	chan->incomingSequence = 0;
 	chan->outgoingSequence = 1;
 	chan->challenge = challenge;
+
+	if (chan->remoteAddress.type == NA_SCION_IP || chan->remoteAddress.type == NA_SCION_IP6)
+	{
+		chan->scionext = qtrue;
+		if (compat) Com_DPrintf("Attempting to use legacy protocol over SCION\n");
+	}
 
 #ifdef USE_LIBSODIUM
 	chan->encrypted = qfalse;
@@ -179,7 +192,7 @@ static void Netchan_SendEncrypted(netchan_t *chan, int length, const void *data,
 		Com_Error(ERR_DROP, "Netchan_SendEncrypted: length = %i", length);
 	memcpy(buf + hdrLen + outlen, chan->nonce, sizeof(chan->nonce));
 
-	NET_SendPacket(chan->sock, total, buf, to);
+	NET_SendPacket(chan->sock, total, buf, to, &chan->pctx);
 }
 #endif // USE_LIBSODIUM
 
@@ -213,14 +226,24 @@ void Netchan_TransmitNextFragment( netchan_t *chan ) {
 		MSG_WriteLong(&send, NETCHAN_GENCHECKSUM(chan->challenge, chan->outgoingSequence));
 
 	// copy the reliable message to the packet first
-	fragmentLength = FRAGMENT_SIZE;
-	if ( chan->unsentFragmentStart  + fragmentLength > chan->unsentLength ) {
-		fragmentLength = chan->unsentLength - chan->unsentFragmentStart;
-	}
+	MSG_WriteShort(&send, chan->unsentFragmentStart);
 
-	MSG_WriteShort( &send, chan->unsentFragmentStart );
-	MSG_WriteShort( &send, fragmentLength );
-	MSG_WriteData( &send, chan->unsentBuffer + chan->unsentFragmentStart, fragmentLength );
+	fragmentLength = chan->scionext ? SCI_FRAGMENT_SIZE(chan) : FRAGMENT_SIZE;
+	if (chan->unsentFragmentStart + fragmentLength >= chan->unsentLength)
+	{
+		// last fragment
+		fragmentLength = chan->unsentLength - chan->unsentFragmentStart;
+		if (chan->scionext)
+		{
+			chan->outgoingSequence++;
+			chan->unsentFragments = qfalse;
+		}
+	}
+	int fragLen = fragmentLength;
+	if (chan->scionext && !chan->unsentFragments)
+		fragLen |= LAST_FRAGMENT_BIT;
+	MSG_WriteShort(&send, fragLen);
+	MSG_WriteData(&send, chan->unsentBuffer + chan->unsentFragmentStart, fragmentLength);
 
 	// send the datagram
 #ifdef USE_LIBSODIUM
@@ -228,7 +251,7 @@ void Netchan_TransmitNextFragment( netchan_t *chan ) {
 		Netchan_SendEncrypted(chan, send.cursize, send.data, &chan->remoteAddress);
 	else
 #endif
-		NET_SendPacket(chan->sock, send.cursize, send.data, &chan->remoteAddress);
+		NET_SendPacket(chan->sock, send.cursize, send.data, &chan->remoteAddress, &chan->pctx);
 
 	// Store send time and size of this packet for rate control
 	chan->lastSentTime = Sys_Milliseconds();
@@ -244,13 +267,16 @@ void Netchan_TransmitNextFragment( netchan_t *chan ) {
 
 	chan->unsentFragmentStart += fragmentLength;
 
-	// this exit condition is a little tricky, because a packet
-	// that is exactly the fragment length still needs to send
-	// a second packet of zero length so that the other side
-	// can tell there aren't more to follow
-	if ( chan->unsentFragmentStart == chan->unsentLength && fragmentLength != FRAGMENT_SIZE ) {
-		chan->outgoingSequence++;
-		chan->unsentFragments = qfalse;
+	if (!chan->scionext)
+	{
+		// this exit condition is a little tricky, because a packet
+		// that is exactly the fragment length still needs to send
+		// a second packet of zero length so that the other side
+		// can tell there aren't more to follow
+		if ( chan->unsentFragmentStart == chan->unsentLength && fragmentLength != FRAGMENT_SIZE ) {
+			chan->outgoingSequence++;
+			chan->unsentFragments = qfalse;
+		}
 	}
 }
 
@@ -265,6 +291,20 @@ A 0 length will still generate a packet.
 void Netchan_Transmit( netchan_t *chan, int length, const byte *data ) {
 	msg_t		send;
 	byte		send_buf[MAX_PACKETLEN];
+	int			fragment_size = FRAGMENT_SIZE;
+
+	if (chan->scionext) {
+		qboolean res = qfalse;
+		if (chan->sock == NS_CLIENT)
+			res = NET_ClientSelectPath(&chan->pctx);
+		else
+			res = NET_ServerSelectPath(&chan->remoteAddress, &chan->pctx);
+		if (!res) {
+			Com_Printf("ERROR: No path to destination %s\n", NET_AdrToString(&chan->remoteAddress));
+			return;
+		}
+		fragment_size = SCI_FRAGMENT_SIZE(chan);
+	}
 
 	if ( length > MAX_MSGLEN ) {
 		Com_Error( ERR_DROP, "Netchan_Transmit: length = %i", length );
@@ -272,7 +312,7 @@ void Netchan_Transmit( netchan_t *chan, int length, const byte *data ) {
 	chan->unsentFragmentStart = 0;
 
 	// fragment large reliable messages
-	if ( length >= FRAGMENT_SIZE ) {
+	if ( length >= fragment_size ) {
 		chan->unsentFragments = qtrue;
 		chan->unsentLength = length;
 		Com_Memcpy( chan->unsentBuffer, data, length );
@@ -307,7 +347,7 @@ void Netchan_Transmit( netchan_t *chan, int length, const byte *data ) {
 		Netchan_SendEncrypted(chan, send.cursize, send.data, &chan->remoteAddress);
 	else
 #endif
-		NET_SendPacket(chan->sock, send.cursize, send.data, &chan->remoteAddress);
+		NET_SendPacket(chan->sock, send.cursize, send.data, &chan->remoteAddress, &chan->pctx);
 
 	// Store send time and size of this packet for rate control
 	chan->lastSentTime = Sys_Milliseconds();
@@ -338,6 +378,7 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 	int			sequence;
 	int			fragmentStart, fragmentLength;
 	qboolean	fragmented;
+	qboolean	lastFragment = qfalse;
 
 	// XOR unscramble all data in the packet after the header
 //	Netchan_UnScramblePacket( msg );
@@ -404,6 +445,12 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 	if ( fragmented ) {
 		fragmentStart = MSG_ReadShort( msg );
 		fragmentLength = MSG_ReadShort( msg );
+		if (chan->scionext) {
+			lastFragment = (fragmentLength & LAST_FRAGMENT_BIT);
+			fragmentLength &= ~LAST_FRAGMENT_BIT;
+		} else {
+			lastFragment = (fragmentLength != FRAGMENT_SIZE);
+		}
 	} else {
 		fragmentStart = 0;		// stop warning message
 		fragmentLength = 0;
@@ -452,7 +499,7 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 
 
 	//
-	// if this is the final framgent of a reliable message,
+	// if this is the final fragment of a reliable message,
 	// bump incoming_reliable_sequence
 	//
 	if ( fragmented ) {
@@ -493,7 +540,7 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 		chan->fragmentLength += fragmentLength;
 
 		// if this wasn't the last fragment, don't process anything
-		if ( fragmentLength == FRAGMENT_SIZE ) {
+		if ( !lastFragment ) {
 			return qfalse;
 		}
 
@@ -605,13 +652,14 @@ typedef struct packetQueue_s {
         int length;
         byte *data;
         netadr_t to;
+		path_context_t pctx;
         int release;
 } packetQueue_t;
 
 packetQueue_t *packetQueue = NULL;
 
-static void NET_QueuePacket( int length, const void *data, const netadr_t *to,
-	int offset )
+static void NET_QueuePacket(int length, const void *data, const netadr_t *to,
+	path_context_t *pctx, int offset)
 {
 	packetQueue_t *new, *next = packetQueue;
 
@@ -623,6 +671,7 @@ static void NET_QueuePacket( int length, const void *data, const netadr_t *to,
 	Com_Memcpy(new->data, data, length);
 	new->length = length;
 	new->to = *to;
+	new->pctx = *pctx;
 	new->release = Sys_Milliseconds() + (int)((float)offset / com_timescale->value);
 	new->next = NULL;
 
@@ -648,7 +697,7 @@ void NET_FlushPacketQueue(void)
 		now = Sys_Milliseconds();
 		if(packetQueue->release >= now)
 			break;
-		Sys_SendPacket(packetQueue->length, packetQueue->data, &packetQueue->to);
+		Sys_SendPacket(packetQueue->length, packetQueue->data, &packetQueue->to, &packetQueue->pctx);
 		last = packetQueue;
 		packetQueue = packetQueue->next;
 		Z_Free(last->data);
@@ -656,7 +705,7 @@ void NET_FlushPacketQueue(void)
 	}
 }
 
-void NET_SendPacket( netsrc_t sock, int length, const void *data, const netadr_t *to ) {
+void NET_SendPacket(netsrc_t sock, int length, const void *data, const netadr_t *to, path_context_t *pctx) {
 
 	// sequenced packets are shown in netchan, so just show oob
 	if ( showpackets->integer && *(int *)data == -1 )	{
@@ -675,13 +724,13 @@ void NET_SendPacket( netsrc_t sock, int length, const void *data, const netadr_t
 	}
 
 	if ( sock == NS_CLIENT && cl_packetdelay->integer > 0 ) {
-		NET_QueuePacket( length, data, to, cl_packetdelay->integer );
+		NET_QueuePacket(length, data, to, pctx, cl_packetdelay->integer);
 	}
 	else if ( sock == NS_SERVER && sv_packetdelay->integer > 0 ) {
-		NET_QueuePacket( length, data, to, sv_packetdelay->integer );
+		NET_QueuePacket(length, data, to, pctx, sv_packetdelay->integer);
 	}
 	else {
-		Sys_SendPacket( length, data, to );
+		Sys_SendPacket(length, data, to, pctx);
 	}
 }
 
@@ -708,7 +757,7 @@ void QDECL NET_OutOfBandPrint( netsrc_t sock, const netadr_t *adr, const char *f
 	va_end( argptr );
 
 	// send the datagram
-	NET_SendPacket( sock, strlen( string ), string, adr );
+	NET_SendPacket( sock, strlen( string ), string, adr, NULL );
 }
 
 /*
@@ -737,7 +786,36 @@ void QDECL NET_OutOfBandData( netsrc_t sock, const netadr_t *adr, byte *format, 
 	mbuf.cursize = len+4;
 	Huff_Compress( &mbuf, 12);
 	// send the datagram
-	NET_SendPacket( sock, mbuf.cursize, mbuf.data, adr );
+	NET_SendPacket( sock, mbuf.cursize, mbuf.data, adr, NULL );
+}
+
+/*
+=============
+NET_PanToAdr
+
+Initializes a netadr_t from a PAN UDP address. All unused fields are zeroed.
+=============
+*/
+void NET_PanToAdr(PanUDPAddr pan, netadr_t *a)
+{
+	Com_Memset(a, 0, sizeof(netadr_t));
+
+	uint64_t ia;
+	PanUDPAddrGetIA(pan, &ia);
+	memcpy(a->isd, &ia, 2);
+	memcpy(a->asn, ((byte*)&ia + 2), 6);
+
+	if (!PanUDPAddrIsIPv6(pan)) {
+		a->type = NA_SCION_IP;
+		PanUDPAddrGetIPv4(pan, a->ip);
+		memset(a->ip6, 0, 16);
+	} else {
+		a->type = NA_SCION_IP6;
+		PanUDPAddrGetIPv6(pan, a->ip6);
+		memset(a->ip, 0, 4);
+	}
+
+	a->port = BigShort(PanUDPAddrGetPort(pan));
 }
 
 /*
@@ -768,25 +846,8 @@ int NET_StringToAdr( const char *s, netadr_t *a, netadrtype_t family )
 		PanUDPAddr resolved = PAN_INVALID_HANDLE;
 		if (PanResolveUDPAddr(s, &resolved) == PAN_ERR_OK)
 		{
-			uint64_t ia;
-			PanUDPAddrGetIA(resolved, &ia);
-			memcpy(a->isd, &ia, 2);
-			memcpy(a->asn, ((byte*)&ia + 2), 6);
-
-			if (!PanUDPAddrIsIPv6(resolved)) {
-				a->type = NA_SCION_IP;
-				PanUDPAddrGetIPv4(resolved, a->ip);
-				memset(a->ip6, 0, 16);
-			} else {
-				a->type = NA_SCION_IP6;
-				PanUDPAddrGetIPv6(resolved, a->ip6);
-				memset(a->ip, 0, 4);
-			}
-
-			a->port = BigShort(PanUDPAddrGetPort(resolved));
-
+			NET_PanToAdr(resolved, a);
 			PanDeleteHandle(resolved);
-
 			return a->port != 0 ? 1 : 2;
 		}
 		else if (family != NA_UNSPEC)

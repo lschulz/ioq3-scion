@@ -1180,8 +1180,8 @@ static void SV_Status_f( void ) {
 
 	Com_Printf ("map: %s\n", sv_mapname->string );
 
-	Com_Printf ("cl score ping name            address                                 rate  enc\n");
-	Com_Printf ("-- ----- ---- --------------- --------------------------------------- ----- ---\n");
+	Com_Printf ("cl score ping name            address                              rate  enc\n");
+	Com_Printf ("-- ----- ---- --------------- ------------------------------------ ----- ---\n");
 	for (i=0,cl=svs.clients ; i < sv_maxclients->integer ; i++,cl++)
 	{
 		if (!cl->state)
@@ -1215,7 +1215,7 @@ static void SV_Status_f( void ) {
 		// TTimo adding a ^7 to reset the color
 		s = NET_AdrToString( &cl->netchan.remoteAddress );
 		Com_Printf ("^7%s", s);
-		l = 39 - strlen(s);
+		l = 36 - strlen(s);
 		j = 0;
 
 		do

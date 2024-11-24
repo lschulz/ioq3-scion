@@ -1785,7 +1785,7 @@ void CL_Connect_f( void ) {
 		if (crypto_kx_keypair(clc.publicKey, clc.secretKey))
 		{
 			clc.state = CA_DISCONNECTED;
-			Com_Printf("crypto_kx_keypair failed\n");
+			Com_Error(ERR_DROP, "crypto_kx_keypair failed");
 			return;
 		}
 		clc.encrypted = qtrue;
@@ -1923,7 +1923,7 @@ void CL_Rcon_f( void ) {
 		}
 	}
 
-	NET_SendPacket (NS_CLIENT, strlen(message)+1, message, &to);
+	NET_SendPacket (NS_CLIENT, strlen(message)+1, message, &to, NULL);
 	cls.rconAddress = to;
 }
 
@@ -2398,10 +2398,12 @@ void CL_CheckForResend( void ) {
 
 	switch ( clc.state ) {
 	case CA_CONNECTING:
+#if 0
 		// requesting a challenge .. IPv6 users always get in as authorize server supports no ipv6.
 #ifndef STANDALONE
 		if (!com_standalone->integer && clc.serverAddress.type == NA_IP && !Sys_IsLANAddress( &clc.serverAddress ) )
 			CL_RequestAuthorization();
+#endif
 #endif
 
 		// The challenge request shall be followed by a client challenge so no malicious server can hijack this connection.
@@ -2427,7 +2429,7 @@ void CL_CheckForResend( void ) {
 			if (cl_encryption->integer > 1)
 			{
 				clc.state = CA_DISCONNECTED;
-				Com_Printf("Cannot open encrypted connection to legacy server\n");
+				Com_Error(ERR_DROP, "Cannot open encrypted connection to legacy server");
 				return;
 			}
 #endif
@@ -2782,7 +2784,7 @@ void CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 			if (cl_encryption->integer > 1)
 			{
 				clc.state = CA_DISCONNECTED;
-				Com_Printf("Cannot open encrypted connection to legacy server\n");
+				Com_Error(ERR_DROP, "Cannot open encrypted connection to legacy server");
 				return;
 			}
 		}
@@ -2857,7 +2859,7 @@ void CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 				clc.encrypted = qfalse;
 				Com_Printf(S_COLOR_YELLOW "WARNING: Server does not support encryption.\n");
 				if (cl_encryption->integer > 1)
-					Com_Error(ERR_DISCONNECT, "Server does not support encryption.");
+					Com_Error(ERR_DROP, "Server does not support encryption");
 			}
 			else
 			{
@@ -2865,10 +2867,10 @@ void CL_ConnectionlessPacket( const netadr_t *from, msg_t *msg ) {
 				{
 					Com_Printf(S_COLOR_RED
 						"WARNING: Server public key has changed. Disconnecting.\n");
-					Com_Error(ERR_DISCONNECT, "Key echange with server failed.");
+					Com_Error(ERR_DROP, "Could not validate server identity");
 				}
 				if (!Netchan_InitSession(&clc.netchan, clc.publicKey, clc.secretKey, svKey))
-					Com_Error(ERR_DISCONNECT, "Key echange with server failed.");
+					Com_Error(ERR_DROP, "Key echange with server failed");
 				sodium_memzero(clc.publicKey, sizeof(clc.publicKey));
 				sodium_memzero(clc.secretKey, sizeof(clc.secretKey));
 			}
@@ -4316,9 +4318,9 @@ void CL_LocalServers_f( void ) {
 			to.port = BigShort( (short)(PORT_SERVER + j) );
 
 			to.type = NA_BROADCAST;
-			NET_SendPacket( NS_CLIENT, strlen( message ), message, &to );
+			NET_SendPacket( NS_CLIENT, strlen( message ), message, &to, NULL );
 			to.type = NA_MULTICAST6;
-			NET_SendPacket( NS_CLIENT, strlen( message ), message, &to );
+			NET_SendPacket( NS_CLIENT, strlen( message ), message, &to, NULL );
 		}
 	}
 }

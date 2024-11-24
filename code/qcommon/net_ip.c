@@ -99,6 +99,8 @@ typedef int	ioctlarg_t;
 
 PanSelector NET_PathSelInit(void);
 void NET_PathSelDestroy(void);
+PanReplySelector NET_ReplyPathSelInit(void);
+void NET_ReplyPathSelDestroy(void);
 
 static qboolean usingSocks = qfalse;
 static int networkingEnabled = 0;
@@ -113,15 +115,15 @@ static cvar_t	*net_socksPassword;
 
 static cvar_t	*net_ip;
 static cvar_t	*net_ip6;
-static cvar_t   *net_scion;
+static cvar_t	*net_scion;
 static cvar_t	*net_port;
 static cvar_t	*net_port6;
-static cvar_t   *net_scion_port;
+static cvar_t	*net_scion_port;
 static cvar_t	*net_mcast6addr;
 static cvar_t	*net_mcast6iface;
 
 static cvar_t	*net_dropsim;
-static cvar_t   *net_oobTimeout;
+static cvar_t	*net_oobTimeout;
 
 static struct sockaddr	socksRelayAddr;
 
@@ -653,17 +655,18 @@ NET_GetLocalForPan
 Get the local address for PAN connections.
 ====================
 */
-void NET_GetLocalForPan(char *addr, int size, int offset)
+void NET_GetLocalForPan(char *addr, int size, qboolean withPort)
 {
+	int port = withPort ? net_scion_port->integer : 0;
 	if (strchr(net_scion->string, ':'))
 	{
 		// Probably an IPv6 address
-		Com_sprintf(addr, size, "[%s]:%d", net_scion->string, net_scion_port->integer + offset);
+		Com_sprintf(addr, size, "[%s]:%d", net_scion->string, port);
 	}
 	else
 	{
 		// Probably an IPv4 address
-		Com_sprintf(addr, size, "%s:%d", net_scion->string, net_scion_port->integer + offset);
+		Com_sprintf(addr, size, "%s:%d", net_scion->string, port);
 	}
 }
 
@@ -790,7 +793,7 @@ static void NET_ClearOOBSlot(int i)
 	}
 	if (scion_oob[i].conn)
 	{
-		PanConnClose(scion_oob[i].conn);
+		// conn has already been closed by PanConnAdapterClose
 		PanDeleteHandle(scion_oob[i].conn);
 	}
 
@@ -834,15 +837,20 @@ static int NET_OpenOOBConn(const netadr_t *to)
 	// Open connection
 	slot->adr = *to;
 	slot->last = Sys_Milliseconds();
-	NET_GetLocalForPan(local, sizeof(local), 2 + i);
+	NET_GetLocalForPan(local, sizeof(local), qfalse);
 	PanUDPAddr addr = NET_AddressToPan(to);
 	err = PanDialUDP(local, addr, PAN_INVALID_HANDLE, PAN_INVALID_HANDLE, &slot->conn);
 	PanDeleteHandle(addr);
 	if (err)
 	{
 		NET_ClearOOBSlot(i);
+		Com_Printf("WARNING: NET_OpenOOBConn: PanDialUDP failed (%d)\n", err);
 		return -1;
 	}
+	PanUDPAddr boundto = PanConnLocalAddr(slot->conn);
+	char *str = PanUDPAddrToString(boundto);
+	if (str) Com_Printf("Opened OOB connection from %s to %s\n", str, NET_AdrToStringwPort(to));
+	free(str);
 
 	const char *tmp = Sys_TempPath();
 	int pid = Sys_PID();
@@ -868,13 +876,17 @@ static PanListenConn NET_PanListenUDP(char *listen_addr)
 {
 	PanListenConn listen_conn = PAN_INVALID_HANDLE;
 
-	PanError err = PanListenUDP(listen_addr, PAN_INVALID_HANDLE, &listen_conn);
-	if (err) return PAN_INVALID_HANDLE;
+	PanError err = PanListenUDP(listen_addr, NET_ReplyPathSelInit(), &listen_conn);
+	if (err)
+	{
+		Com_Printf("WARNING: NET_PanListenUDP: PanListenUDP failed (%d)\n", err);
+		return PAN_INVALID_HANDLE;
+	}
 
 	PanUDPAddr boundto = PanListenConnLocalAddr(listen_conn);
-	char *addr = PanUDPAddrToString(boundto);
-	if (addr) Com_Printf("Opening SCION socket: %s\n", addr);
-	free(addr);
+	char *str = PanUDPAddrToString(boundto);
+	if (str) Com_Printf("Opened SCION server socket: %s\n", str);
+	free(str);
 	PanDeleteHandle(boundto);
 
 	return listen_conn;
@@ -898,7 +910,7 @@ void NET_ScionServerStart(void)
 
 	if (scion_server_conn == PAN_INVALID_HANDLE)
 	{
-		NET_GetLocalForPan(local, sizeof(local), 0);
+		NET_GetLocalForPan(local, sizeof(local), qtrue);
 		scion_server_conn = NET_PanListenUDP(local);
 		if (scion_server_conn == PAN_INVALID_HANDLE)
 		{
@@ -934,24 +946,24 @@ void NET_ScionServerStop(void)
 {
 	char path[MAX_OSPATH] = {0};
 
-	if ( scion_server_socket != INVALID_SOCKET ) {
+	if (scion_server_socket != INVALID_SOCKET) {
 		closesocket( scion_server_socket );
 		scion_server_socket = INVALID_SOCKET;
 		Com_sprintf(path, sizeof(path), "%s/ioquake3_%d_server.sock", Sys_TempPath(), Sys_PID());
 		unlink(path);
 	}
 
-	if ( scion_server_adapter != PAN_INVALID_HANDLE ) {
+	if (scion_server_adapter != PAN_INVALID_HANDLE) {
 		PanListenAdapterClose( scion_server_adapter );
 		PanDeleteHandle ( scion_server_adapter );
 		scion_server_adapter = PAN_INVALID_HANDLE;
 	}
 
-	if ( scion_server_conn != PAN_INVALID_HANDLE ) {
-		Com_Printf("Closing SCION socket.\n");
-		PanListenConnClose( scion_server_conn );
-		PanDeleteHandle( scion_server_conn );
+	if (scion_server_conn != PAN_INVALID_HANDLE) {
+		// conn has already been closed by PanListenAdapterClose
+		PanDeleteHandle(scion_server_conn);
 		scion_server_conn = PAN_INVALID_HANDLE;
+		NET_ReplyPathSelDestroy();
 	}
 }
 
@@ -986,13 +998,17 @@ qboolean NET_ScionClientConnect(const netadr_t *to)
 	}
 
 	// Dial SCION
-	NET_GetLocalForPan(local, sizeof(local), 0);
+	NET_GetLocalForPan(local, sizeof(local), qtrue);
 	err = PanDialUDP(local, remote, PAN_INVALID_HANDLE, sel, &scion_client_conn);
 	PanDeleteHandle(remote);
 	if (err) {
 		Com_Printf("WARNING: NET_ScionClientConnect: PanDialUDP failed (%d)\n", err);
 		return qfalse;
 	}
+	PanUDPAddr boundto = PanConnLocalAddr(scion_client_conn);
+	char *str = PanUDPAddrToString(boundto);
+	if (str) Com_Printf("Opened SCION client connection from %s to %s\n", str, NET_AdrToStringwPort(to));
+	free(str);
 
 	// Create Unix socket pair for dialed PAN connection.
 	const char *tmp = Sys_TempPath();
@@ -1036,7 +1052,7 @@ void NET_ScionClientClose(void)
 	}
 
 	if ( scion_client_conn != PAN_INVALID_HANDLE ) {
-		PanConnClose(scion_client_conn);
+		// conn has already been closed by PanConnAdapterClose
 		PanDeleteHandle(scion_client_conn);
 		scion_client_conn = PAN_INVALID_HANDLE;
 	}
@@ -1394,10 +1410,40 @@ int Sys_SendPktOnStream(SOCKET sock, const void *data, int length)
 
 /*
 ==================
+Sys_SendPktPanClientSock
+
+Send a packet on a PAN Unix client socket. Sending on a client socket requires
+prepending a path context pointer (pctx) which this function takes care of.
+Sending on a PAN Unix server socket requires additional headers and is not
+implemented here.
+==================
+*/
+int Sys_SendPktPanClientSock(SOCKET client_sock, PanContext pctx, const void *data, int length)
+{
+	static char buffer[PAN_BUFFER_SIZE];
+
+	if (length > (PAN_BUFFER_SIZE - PAN_CTX_HDR_SIZE))
+	{
+		errno = EMSGSIZE;
+		return -1;
+	}
+	memcpy(buffer, &pctx, PAN_CTX_HDR_SIZE);
+	memcpy(buffer + PAN_CTX_HDR_SIZE, data, length);
+
+	int msgLen = length + PAN_CTX_HDR_SIZE;
+	#ifdef PAN_UNIX_STREAM
+		return Sys_SendPktOnStream(client_sock, buffer, msgLen);
+	#else
+		return send(client_sock, buffer, msgLen, 0);
+	#endif
+}
+
+/*
+==================
 Sys_SendPacket
 ==================
 */
-void Sys_SendPacket( int length, const void *data, const netadr_t *to )
+void Sys_SendPacket(int length, const void *data, const netadr_t *to, path_context_t *pctx)
 {
 	int ret = SOCKET_ERROR;
 
@@ -1425,11 +1471,7 @@ void Sys_SendPacket( int length, const void *data, const netadr_t *to )
 		qboolean sent = qfalse;
 		if (scion_client_socket && NET_CompareBaseAdr(to, &scion_client_remote))
 		{
-		#ifdef PAN_UNIX_STREAM
-			ret = Sys_SendPktOnStream(scion_client_socket, data, length);
-		#else
-			ret = send(scion_client_socket, data, length, 0);
-		#endif
+			ret = Sys_SendPktPanClientSock(scion_client_socket, (PanContext)pctx, data, length);
 			sent = qtrue;
 		}
 		if (!sent)
@@ -1441,11 +1483,7 @@ void Sys_SendPacket( int length, const void *data, const netadr_t *to )
 				if (NET_CompareAdr(to, &scion_oob[i].adr))
 				{
 					scion_oob[i].last = Sys_Milliseconds();
-				#ifdef PAN_UNIX_STREAM
-					ret = Sys_SendPktOnStream(scion_oob[i].socket, data, length);
-				#else
-					ret = send(scion_oob[i].socket, data, length, 0);
-				#endif
+					ret = Sys_SendPktPanClientSock(scion_oob[i].socket, (PanContext)pctx, data, length);
 					sent = qtrue;
 				}
 			}
@@ -1453,7 +1491,7 @@ void Sys_SendPacket( int length, const void *data, const netadr_t *to )
 		if (!sent && scion_server_conn)
 		{
 			PanUDPAddr addr = NET_AddressToPan(to);
-			if (PanListenConnWriteTo(scion_server_conn, data, length, addr, &ret) == PAN_ERR_OK)
+			if (PanListenConnWriteToWithCtx(scion_server_conn, (PanContext)pctx, data, length, addr, &ret) == PAN_ERR_OK)
 				sent = qtrue;
 			PanDeleteHandle(addr);
 		}
@@ -1462,11 +1500,7 @@ void Sys_SendPacket( int length, const void *data, const netadr_t *to )
 			int i = NET_OpenOOBConn(to);
 			if (i >= 0)
 			{
-			#ifdef PAN_UNIX_STREAM
-				ret = Sys_SendPktOnStream(scion_oob[i].socket, data, length);
-			#else
-				ret = send(scion_oob[i].socket, data, length, 0);
-			#endif
+				ret = Sys_SendPktPanClientSock(scion_oob[i].socket, (PanContext)pctx, data, length);
 				sent = qtrue;
 			}
 		}
@@ -2305,7 +2339,7 @@ static qboolean NET_GetCvars( void ) {
 	modified += net_port6->modified;
 	net_port6->modified = qfalse;
 
-	net_scion_port = Cvar_Get( "net_scion_port", va( "%i", PORT_SERVER ), CVAR_LATCH );
+	net_scion_port = Cvar_Get( "net_scion_port", va( "%i", PORT_SERVER_SCION ), CVAR_LATCH );
 	modified += net_scion_port->modified;
 	net_scion_port->modified = qfalse;
 
@@ -2343,7 +2377,7 @@ static qboolean NET_GetCvars( void ) {
 	net_socksPassword->modified = qfalse;
 
 	net_dropsim = Cvar_Get("net_dropsim", "", CVAR_TEMP);
-	net_oobTimeout = Cvar_Get("net_oobTimeout", "1000", CVAR_ARCHIVE);
+	net_oobTimeout = Cvar_Get("net_oobTimeout", "10000", CVAR_ARCHIVE);
 
 	return modified ? qtrue : qfalse;
 }

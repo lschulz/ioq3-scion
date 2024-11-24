@@ -49,5 +49,5 @@ qboolean	NET_StringToAdr (char *s, netadr_t *a)
 Sys_SendPacket
 ==================
 */
-void Sys_SendPacket( int length, void *data, const netadr_t *to ) {
+void Sys_SendPacket( int length, void *data, const netadr_t *to, path_context_t *pctx ) {
 }

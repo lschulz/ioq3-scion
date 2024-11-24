@@ -1933,7 +1933,9 @@ Q3OBJ = \
   $(B)/client/msg.o \
   $(B)/client/net_chan.o \
   $(B)/client/net_ip.o \
+  $(B)/client/net_path.o \
   $(B)/client/net_path_sel.o \
+  $(B)/client/net_reply_path_sel.o \
   $(B)/client/huffman.o \
   \
   $(B)/client/snd_altivec.o \
@@ -2511,7 +2513,9 @@ Q3DOBJ = \
   $(B)/ded/msg.o \
   $(B)/ded/net_chan.o \
   $(B)/ded/net_ip.o \
-  $(B)/client/net_path_sel.o \
+  $(B)/ded/net_path.o \
+  $(B)/ded/net_path_sel.o \
+  $(B)/ded/net_reply_path_sel.o \
   $(B)/ded/huffman.o \
   \
   $(B)/ded/q_math.o \

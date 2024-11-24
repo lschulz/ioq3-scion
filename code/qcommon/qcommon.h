@@ -182,14 +182,21 @@ typedef enum {
 typedef struct {
 	netadrtype_t	type;
 
-	byte isd[2];  // for SCION
-	byte asn[6];  // for SCION
+	byte isd[2];	// for SCION
+	byte asn[6];	// for SCION
 	byte ip[4];
 	byte ip6[16];
 
 	unsigned short	port;
 	unsigned long	scope_id;	// Needed for IPv6 link-local addresses
 } netadr_t;
+
+typedef struct
+{
+	// set by path selector
+	uint32_t	hash;	// path hash
+	int			mss;	// path MTU minus UDP/SCION headers
+} path_context_t;
 
 void		NET_Init( void );
 void		NET_Shutdown( void );
@@ -201,7 +208,7 @@ qboolean    NET_ScionClientConnect(const netadr_t *to);
 void        NET_ScionClientClose(void);
 
 void		NET_FlushPacketQueue(void);
-void		NET_SendPacket (netsrc_t sock, int length, const void *data, const netadr_t *to);
+void		NET_SendPacket (netsrc_t sock, int length, const void *data, const netadr_t *to, path_context_t *pctx);
 void		QDECL NET_OutOfBandPrint( netsrc_t net_socket, const netadr_t *adr, const char *format, ...) __attribute__ ((format (printf, 3, 4)));
 void		QDECL NET_OutOfBandData( netsrc_t sock, const netadr_t *adr, byte *format, int len );
 
@@ -209,10 +216,10 @@ qboolean	NET_CompareAdr (const netadr_t *a, const netadr_t *b);
 qboolean	NET_CompareBaseAdrMask(const netadr_t *a, const netadr_t *b, int netmask);
 qboolean	NET_CompareBaseAdr (const netadr_t *a, const netadr_t *b);
 qboolean	NET_IsLocalAddress (const netadr_t *adr);
-void		NET_GetLocalForPan(char *addr, int size, int offset);
 PanUDPAddr 	NET_AddressToPan(const netadr_t *to);
 const char	*NET_AdrToString (const netadr_t *a);
 const char	*NET_AdrToStringwPort (const netadr_t *a);
+void		NET_PanToAdr(PanUDPAddr pan, netadr_t *a);
 int			NET_StringToAdr (const char *s, netadr_t *a, netadrtype_t family);
 qboolean	NET_GetLoopPacket (netsrc_t sock, netadr_t *net_from, msg_t *net_message);
 void		NET_JoinMulticast6(void);
@@ -261,6 +268,10 @@ typedef struct {
 	int		lastSentTime;
 	int		lastSentSize;
 
+	// SCION
+	qboolean		scionext;	// enable protocol extensions
+	path_context_t	pctx;		// context for path selector
+
 #ifdef USE_LIBSODIUM
 	// encryption
 	qboolean encrypted;
@@ -302,9 +313,9 @@ PROTOCOL
 // NOTE: that stuff only works with two digits protocols
 extern int demo_protocols[];
 
-#if !defined UPDATE_SERVER_NAME && !defined STANDALONE
-#define	UPDATE_SERVER_NAME	"update.quake3arena.com"
-#endif
+// #if !defined UPDATE_SERVER_NAME && !defined STANDALONE
+// #define	UPDATE_SERVER_NAME	"update.quake3arena.com"
+// #endif
 // override on command line, config files etc.
 #ifndef MASTER_SERVER_NAME
 #define MASTER_SERVER_NAME	"master.quake3arena.com"
@@ -322,6 +333,7 @@ extern int demo_protocols[];
 #define	PORT_MASTER			27950
 #define	PORT_UPDATE			27951
 #define	PORT_SERVER			27960
+#define PORT_SERVER_SCION   27961   // avoid port collision with IP
 #define	NUM_SERVER_PORTS	4		// broadcast scan this many ports after
 									// PORT_SERVER so a single machine can
 									// run multiple servers
@@ -1152,7 +1164,7 @@ cpuFeatures_t Sys_GetProcessorFeatures( void );
 
 void	Sys_SetErrorText( const char *text );
 
-void	Sys_SendPacket( int length, const void *data, const netadr_t *to );
+void	Sys_SendPacket(int length, const void *data, const netadr_t *to, path_context_t *pctx);
 qboolean Sys_SendScionPacketVia(int length, const void *data, const netadr_t *to, PanPath path);
 
 qboolean	Sys_StringToAdr( const char *s, netadr_t *a, netadrtype_t family );

@@ -49,8 +49,9 @@ GAME OPTIONS MENU
 #define ID_SYNCEVERYFRAME		134
 #define ID_FORCEMODEL			135
 #define ID_DRAWTEAMOVERLAY		136
-#define ID_ALLOWDOWNLOAD			137
-#define ID_BACK					138
+#define ID_ENCRYPTION			137
+// #define ID_ALLOWDOWNLOAD		138
+#define ID_BACK					139
 
 #define	NUM_CROSSHAIRS			10
 
@@ -72,7 +73,8 @@ typedef struct {
 	menuradiobutton_s	synceveryframe;
 	menuradiobutton_s	forcemodel;
 	menulist_s			drawteamoverlay;
-	menuradiobutton_s	allowdownload;
+	menulist_s			encryption;
+	// menuradiobutton_s	allowdownload;
 	menubitmap_s		back;
 
 	qhandle_t			crosshairShader[NUM_CROSSHAIRS];
@@ -89,6 +91,14 @@ static const char *teamoverlay_names[] =
 	NULL
 };
 
+static const char *encryption_options[] =
+{
+	"disabled",
+	"optional",
+	"enforced",
+	NULL
+};
+
 static void Preferences_SetMenuItems( void ) {
 	s_preferences.crosshair.curvalue		= (int)trap_Cvar_VariableValue( "cg_drawCrosshair" ) % NUM_CROSSHAIRS;
 	s_preferences.simpleitems.curvalue		= trap_Cvar_VariableValue( "cg_simpleItems" ) != 0;
@@ -100,7 +110,8 @@ static void Preferences_SetMenuItems( void ) {
 	s_preferences.synceveryframe.curvalue	= trap_Cvar_VariableValue( "r_finish" ) != 0;
 	s_preferences.forcemodel.curvalue		= trap_Cvar_VariableValue( "cg_forcemodel" ) != 0;
 	s_preferences.drawteamoverlay.curvalue	= Com_Clamp( 0, 3, trap_Cvar_VariableValue( "cg_drawTeamOverlay" ) );
-	s_preferences.allowdownload.curvalue	= trap_Cvar_VariableValue( "cl_allowDownload" ) != 0;
+	s_preferences.encryption.curvalue		= Com_Clamp( 0, 2, trap_Cvar_VariableValue( "cl_encryption" ) );
+	// s_preferences.allowdownload.curvalue	= trap_Cvar_VariableValue( "cl_allowDownload" ) != 0;
 }
 
 
@@ -135,7 +146,7 @@ static void Preferences_Event( void* ptr, int notification ) {
 
 	case ID_DYNAMICLIGHTS:
 		trap_Cvar_SetValue( "r_dynamiclight", s_preferences.dynamiclights.curvalue );
-		break;		
+		break;
 
 	case ID_IDENTIFYTARGET:
 		trap_Cvar_SetValue( "cg_drawCrosshairNames", s_preferences.identifytarget.curvalue );
@@ -149,14 +160,19 @@ static void Preferences_Event( void* ptr, int notification ) {
 		trap_Cvar_SetValue( "cg_forcemodel", s_preferences.forcemodel.curvalue );
 		break;
 
+	case ID_ENCRYPTION:
+		trap_Cvar_SetValue( "cl_encryption", s_preferences.encryption.curvalue );
+		trap_Cvar_SetValue( "sv_encryption", s_preferences.encryption.curvalue );
+		break;
+
 	case ID_DRAWTEAMOVERLAY:
 		trap_Cvar_SetValue( "cg_drawTeamOverlay", s_preferences.drawteamoverlay.curvalue );
 		break;
 
-	case ID_ALLOWDOWNLOAD:
-		trap_Cvar_SetValue( "cl_allowDownload", s_preferences.allowdownload.curvalue );
-		trap_Cvar_SetValue( "sv_allowDownload", s_preferences.allowdownload.curvalue );
-		break;
+	// case ID_ALLOWDOWNLOAD:
+	// 	trap_Cvar_SetValue( "cl_allowDownload", s_preferences.allowdownload.curvalue );
+	// 	trap_Cvar_SetValue( "sv_allowDownload", s_preferences.allowdownload.curvalue );
+	// 	break;
 
 	case ID_BACK:
 		UI_PopMenu();
@@ -202,7 +218,7 @@ static void Crosshair_Draw( void *self ) {
 	if ( focus )
 	{
 		// draw cursor
-		UI_FillRect( s->generic.left, s->generic.top, s->generic.right-s->generic.left+1, s->generic.bottom-s->generic.top+1, listbar_color ); 
+		UI_FillRect( s->generic.left, s->generic.top, s->generic.right-s->generic.left+1, s->generic.bottom-s->generic.top+1, listbar_color );
 		UI_DrawChar( x, y, 13, UI_CENTER|UI_BLINK|UI_SMALLFONT, color);
 	}
 
@@ -345,13 +361,23 @@ static void Preferences_MenuInit( void ) {
 	s_preferences.drawteamoverlay.itemnames			= teamoverlay_names;
 
 	y += BIGCHAR_HEIGHT+2;
-	s_preferences.allowdownload.generic.type     = MTYPE_RADIOBUTTON;
-	s_preferences.allowdownload.generic.name	   = "Automatic Downloading:";
-	s_preferences.allowdownload.generic.flags	   = QMF_PULSEIFFOCUS|QMF_SMALLFONT;
-	s_preferences.allowdownload.generic.callback = Preferences_Event;
-	s_preferences.allowdownload.generic.id       = ID_ALLOWDOWNLOAD;
-	s_preferences.allowdownload.generic.x	       = PREFERENCES_X_POS;
-	s_preferences.allowdownload.generic.y	       = y;
+	s_preferences.encryption.generic.type     = MTYPE_SPINCONTROL;
+	s_preferences.encryption.generic.name     = "Encrypted connection:";
+	s_preferences.encryption.generic.flags    = QMF_PULSEIFFOCUS|QMF_SMALLFONT;
+	s_preferences.encryption.generic.callback = Preferences_Event;
+	s_preferences.encryption.generic.id       = ID_ENCRYPTION;
+	s_preferences.encryption.generic.x        = PREFERENCES_X_POS;
+	s_preferences.encryption.generic.y        = y;
+	s_preferences.encryption.itemnames        = encryption_options;
+
+	// y += BIGCHAR_HEIGHT+2;
+	// s_preferences.allowdownload.generic.type     = MTYPE_RADIOBUTTON;
+	// s_preferences.allowdownload.generic.name	   = "Automatic Downloading:";
+	// s_preferences.allowdownload.generic.flags	   = QMF_PULSEIFFOCUS|QMF_SMALLFONT;
+	// s_preferences.allowdownload.generic.callback = Preferences_Event;
+	// s_preferences.allowdownload.generic.id       = ID_ALLOWDOWNLOAD;
+	// s_preferences.allowdownload.generic.x	       = PREFERENCES_X_POS;
+	// s_preferences.allowdownload.generic.y	       = y;
 
 	s_preferences.back.generic.type	    = MTYPE_BITMAP;
 	s_preferences.back.generic.name     = ART_BACK0;
@@ -378,7 +404,8 @@ static void Preferences_MenuInit( void ) {
 	Menu_AddItem( &s_preferences.menu, &s_preferences.synceveryframe );
 	Menu_AddItem( &s_preferences.menu, &s_preferences.forcemodel );
 	Menu_AddItem( &s_preferences.menu, &s_preferences.drawteamoverlay );
-	Menu_AddItem( &s_preferences.menu, &s_preferences.allowdownload );
+	Menu_AddItem( &s_preferences.menu, &s_preferences.encryption );
+	// Menu_AddItem( &s_preferences.menu, &s_preferences.allowdownload );
 
 	Menu_AddItem( &s_preferences.menu, &s_preferences.back );
 

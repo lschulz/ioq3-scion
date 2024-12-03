@@ -317,11 +317,11 @@ extern int demo_protocols[];
 // #define	UPDATE_SERVER_NAME	"update.quake3arena.com"
 // #endif
 // override on command line, config files etc.
-#ifndef MASTER_SERVER_NAME
-#define MASTER_SERVER_NAME	"master.quake3arena.com"
-#endif
+// #ifndef MASTER_SERVER_NAME
+// #define MASTER_SERVER_NAME	"master.quake3arena.com"
+// #endif
 
-#ifndef STANDALONE
+#if 0
   #ifndef AUTHORIZE_SERVER_NAME
     #define	AUTHORIZE_SERVER_NAME	"authorize.quake3arena.com"
   #endif

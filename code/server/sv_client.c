@@ -144,7 +144,7 @@ void SV_GetChallenge(const netadr_t *from)
 	challenge->wasrefused = qfalse;
 	challenge->time = svs.time;
 
-#ifndef STANDALONE
+#if 0
 	// Drop the authorize stuff if this client is coming in via v6 as the auth server does not support ipv6.
 	// Drop also for addresses coming in on local LAN and for stand-alone games independent from id's assets.
 	if(challenge->adr.type == NA_IP && !com_standalone->integer && !Sys_IsLANAddress(from))
@@ -201,7 +201,7 @@ void SV_GetChallenge(const netadr_t *from)
 			   challenge->challenge, clientChallenge, com_protocol->integer);
 }
 
-#ifndef STANDALONE
+#if 0
 /*
 ====================
 SV_AuthorizeIpPacket

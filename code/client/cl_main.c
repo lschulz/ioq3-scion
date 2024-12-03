@@ -1592,7 +1592,7 @@ If no response is received from the authorize server after two tries, the client
 in anyway.
 ===================
 */
-#ifndef STANDALONE
+#if 0
 void CL_RequestAuthorization( void ) {
 	char	nums[64];
 	int		i, j, l;
@@ -2398,12 +2398,10 @@ void CL_CheckForResend( void ) {
 
 	switch ( clc.state ) {
 	case CA_CONNECTING:
-#if 0
 		// requesting a challenge .. IPv6 users always get in as authorize server supports no ipv6.
-#ifndef STANDALONE
+#if 0
 		if (!com_standalone->integer && clc.serverAddress.type == NA_IP && !Sys_IsLANAddress( &clc.serverAddress ) )
 			CL_RequestAuthorization();
-#endif
 #endif
 
 		// The challenge request shall be followed by a client challenge so no malicious server can hijack this connection.

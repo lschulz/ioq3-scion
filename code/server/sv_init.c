@@ -642,7 +642,7 @@ static void SV_LoadKeys(void)
 	}
 	else
 	{
-		if (len > 0) FS_FCloseFile(f);
+		if (f > 0) FS_FCloseFile(f);
 
 		crypto_kx_keypair(svs.publicKey, svs.secretKey);
 

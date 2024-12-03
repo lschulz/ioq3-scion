@@ -388,6 +388,8 @@ void SV_DirectConnect( const netadr_t *from ) {
 		clKey = Info_ValueForKey(userinfo, "key");
 		if (*clKey == '\0' && sv_encryption->integer > 1)
 		{
+			NET_OutOfBandPrint(NS_SERVER, from,
+				"print\nThis ioq3-scion server allows only encrypted connections.\n");
 			Com_DPrintf("%s:reconnect rejected : no client key\n", NET_AdrToString (from));
 			return;
 		}

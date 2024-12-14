@@ -579,12 +579,30 @@ const char	*NET_AdrToString (const netadr_t *a)
 		ssize_t offset = 0;
 		const ssize_t len = sizeof(s);
 
-		int ret = Com_sprintf(s, len, "%hu-%hx:%hx:%hx,",
-			(uint16_t)(a->isd[0] << 8) | (uint16_t)a->isd[1],
-			(uint16_t)(a->asn[0] << 8) | (uint16_t)a->asn[1],
-			(uint16_t)(a->asn[2] << 8) | (uint16_t)a->asn[3],
-			(uint16_t)(a->asn[4] << 8) | (uint16_t)a->asn[5]);
-		if (ret > 0) offset += ret;
+		// big endian ASN to integer in host byte order
+		uint64_t asn = 0;
+		for (int i = 0; i < sizeof(a->asn); ++i)
+			asn |= (uint64_t)(a->asn[i]) << ((sizeof(a->asn) - i - 1) * 8);
+
+		int ret = 0;
+		if (asn < (1ull << 32))
+		{
+			// decimal ASN
+			ret = Com_sprintf(s, len, "%hu-%u,",
+				(uint16_t)(a->isd[0] << 8) | (uint16_t)a->isd[1],
+				(uint32_t)asn);
+			if (ret > 0) offset += ret;
+		}
+		else
+		{
+			// hexadecimal ASN
+			ret = Com_sprintf(s + offset, len, "%hu-%hx:%hx:%hx,",
+				(uint16_t)(a->isd[0] << 8) | (uint16_t)a->isd[1],
+				(uint16_t)(asn >> 32),
+				(uint16_t)(asn >> 16),
+				(uint16_t)(asn));
+			if (ret > 0) offset += ret;
+		}
 
 		if (a->type == NA_SCION_IP)
 		{
@@ -615,9 +633,9 @@ const char	*NET_AdrToStringwPort (const netadr_t *a)
 		Com_sprintf (s, sizeof(s), "loopback");
 	else if (a->type == NA_BOT)
 		Com_sprintf (s, sizeof(s), "bot");
-	else if(a->type == NA_IP || a->type == NA_SCION_IP || a->type == NA_SCION_IP6)
+	else if(a->type == NA_IP)
 		Com_sprintf(s, sizeof(s), "%s:%hu", NET_AdrToString(a), ntohs(a->port));
-	else if(a->type == NA_IP6)
+	else if(a->type == NA_IP6 || a->type == NA_SCION_IP || a->type == NA_SCION_IP6)
 		Com_sprintf(s, sizeof(s), "[%s]:%hu", NET_AdrToString(a), ntohs(a->port));
 
 	return s;

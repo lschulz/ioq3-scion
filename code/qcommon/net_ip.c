@@ -269,6 +269,23 @@ char *NET_ErrorString( void ) {
 #endif
 }
 
+
+/*
+====================
+NET_PanErrorString
+====================
+*/
+char* NET_PanErrorString(void)
+{
+	static char buffer[1024];
+	char *text = PanGetLastError();
+	if (!text) return "";
+	Q_strncpyz(buffer, text, sizeof(buffer));
+	free(text);
+	return buffer;
+}
+
+
 static void NetadrToSockadr( const netadr_t *a, struct sockaddr *s ) {
 	if( a->type == NA_BROADCAST ) {
 		((struct sockaddr_in *)s)->sin_family = AF_INET;
@@ -724,13 +741,15 @@ static qboolean NET_PanUnixSocket(
 	if (listen) {
 		err = PanNewListenAdapter(conn, pan_addr, local_addr, pan_sock);
 		if (err) {
-			Com_Printf("WARNING: NET_PanUnixSocket: PanNewListenSockAdapter failed (%d)\n", err);
+			Com_Printf("WARNING: NET_PanUnixSocket: PanNewListenSockAdapter: %s\n",
+				NET_PanErrorString());
 			return qfalse;
 		}
 	} else {
 		err = PanNewConnAdapter(conn, pan_addr, local_addr, pan_sock);
 		if (err) {
-			Com_Printf("WARNING: NET_PanUnixSocket: PanNewConnSockAdapter failed (%d)\n", err);
+			Com_Printf("WARNING: NET_PanUnixSocket: PanNewConnSockAdapter: %s\n",
+				NET_PanErrorString());
 			goto pan_cleanup;
 		}
 	}
@@ -862,7 +881,7 @@ static int NET_OpenOOBConn(const netadr_t *to)
 	if (err)
 	{
 		NET_ClearOOBSlot(i);
-		Com_Printf("WARNING: NET_OpenOOBConn: PanDialUDP failed (%d)\n", err);
+		Com_Printf("WARNING: NET_OpenOOBConn: PanDialUDP: %s\n", NET_PanErrorString());
 		return -1;
 	}
 	PanUDPAddr boundto = PanConnLocalAddr(slot->conn);
@@ -897,7 +916,7 @@ static PanListenConn NET_PanListenUDP(char *listen_addr)
 	PanError err = PanListenUDP(listen_addr, NET_ReplyPathSelInit(), &listen_conn);
 	if (err)
 	{
-		Com_Printf("WARNING: NET_PanListenUDP: PanListenUDP failed (%d)\n", err);
+		Com_Printf("WARNING: NET_PanListenUDP: PanListenUDP: %s\n", NET_PanErrorString());
 		return PAN_INVALID_HANDLE;
 	}
 

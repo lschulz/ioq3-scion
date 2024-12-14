@@ -1761,8 +1761,8 @@ void CL_Connect_f( void ) {
 
 	if (clc.serverAddress.type == NA_SCION_IP || clc.serverAddress.type == NA_SCION_IP6) {
 		if (!NET_ScionClientConnect(&clc.serverAddress)) {
-			Com_Printf("Opening SCION connection to server failed\n");
 			clc.state = CA_DISCONNECTED;
+			Com_Error(ERR_DROP, "Opening connection failed: %s\n", NET_PanErrorString());
 			return;
 		}
 	}
